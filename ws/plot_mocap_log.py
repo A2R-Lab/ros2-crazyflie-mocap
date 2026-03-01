@@ -7,6 +7,15 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
+def find_latest_mocap_log(directory: Path):
+    logs = sorted(
+        directory.glob("mocap_log_*.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return logs[0] if logs else None
+
+
 def load_mocap_csv(csv_path: Path):
     data = {
         "time_s": [],
@@ -46,12 +55,13 @@ def load_mocap_csv(csv_path: Path):
 
 def main():
     script_dir = Path(__file__).resolve().parent
+    latest_log = find_latest_mocap_log(script_dir)
     parser = argparse.ArgumentParser(description="Plot Crazyflie mocap log CSV data.")
     parser.add_argument(
         "--input",
         type=Path,
-        default=script_dir / "mocap_log_20260301_192828.csv",
-        help="Path to mocap CSV log file",
+        default=latest_log,
+        help="Path to mocap CSV log file (default: latest mocap_log_*.csv in script directory)",
     )
     parser.add_argument(
         "--output",
@@ -65,6 +75,10 @@ def main():
         help="Show interactive plot window",
     )
     args = parser.parse_args()
+    if args.input is None:
+        raise FileNotFoundError(
+            f"No mocap_log_*.csv found in {script_dir}. Provide --input explicitly."
+        )
 
     data, has_setpoint = load_mocap_csv(args.input)
     time_s = data["time_s"]

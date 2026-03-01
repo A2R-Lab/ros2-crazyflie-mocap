@@ -23,7 +23,7 @@ import threading
 
 # Crazyflie URI
 URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E8')
-DELTA = 0.20
+DELTA = 0.10
 def quaternion_to_yaw(qx, qy, qz, qw):
     """Extract yaw (rotation around Z) from quaternion in radians."""
     # Yaw (z-axis rotation)
@@ -719,7 +719,7 @@ class CrazyflieROS2Node(Node):
         # Trajectory offset [x, y, z, yaw_deg] in world frame.
         # Each CSV point is applied as: world_target = trajectory_offset + trajectory_point.
         # Trajectory point (0, 0, 0, 0) is located at trajectory_offset.
-        self.declare_parameter('trajectory_offset', [0.2, -0.6, 0.5, 0.0])
+        self.declare_parameter('trajectory_offset', [0.45, -0.55, 0.3, 0.0])
         # x=0.390 y=-0.582 z=0.517
         # Get parameters
         self.uri = self.get_parameter('uri').value
