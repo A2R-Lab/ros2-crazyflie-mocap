@@ -66,7 +66,7 @@ def main():
     parser.add_argument(
         "--output",
         type=Path,
-        default=script_dir / "mocap_log_20260301_192828_plot.png",
+        default=script_dir / (str(latest_log) + "_plot.png"),
         help="Path to output PNG file",
     )
     parser.add_argument(

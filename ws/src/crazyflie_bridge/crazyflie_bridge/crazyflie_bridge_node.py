@@ -22,7 +22,7 @@ from geometry_msgs.msg import PoseStamped
 import threading
 
 # Crazyflie URI
-URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E8')
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 DELTA = 0.10
 def quaternion_to_yaw(qx, qy, qz, qw):
     """Extract yaw (rotation around Z) from quaternion in radians."""
@@ -128,8 +128,9 @@ class CrazyflieController:
         # Timing control
         self.last_extpos_time = 0
         self.last_setpoint_time = 0
-        self.extpos_rate = 0.005  # 100Hz
-        self.setpoint_rate = 0.02  # 50Hz
+        self.extpos_rate = 0.008  # 120Hz
+        self.setpoint_rate = 0.2  # 5Hz
+        self.log_period_ms = 10  # 100Hz
         
         # Logging
         self.log_data = {
@@ -139,8 +140,18 @@ class CrazyflieController:
             'stabilizer.roll': 0,
             'stabilizer.pitch': 0,
             'stabilizer.yaw': 0,
-            'range.zrange': 0,
+            'fpga.u1_16': 0,
+            'fpga.u2_16': 0,
+            'fpga.u3_16': 0,
+            'fpga.u4_16': 0,
         }
+        self.log_conf = None
+        self.last_state_print_time = 0.0
+        
+        # Manual CSV logging (enabled/disabled with keyboard command)
+        self.csv_log_file = None
+        self.csv_logging_enabled = False
+        self.disable_setpoint_while_csv_logging = False
         
     def _param_callback(self, name, value):
         logger.info(f'Parameter {name} set to {value}')
@@ -180,23 +191,29 @@ class CrazyflieController:
         return waypoints
     
     def setup_logging(self, cf):
-        """Setup logging configuration for state estimation"""
-        log_conf = LogConfig(name='StateEstimate', period_in_ms=200)
-        
-        # Add variables to log
-        log_conf.add_variable('stateEstimate.x', 'float')
-        log_conf.add_variable('stateEstimate.y', 'float')
-        log_conf.add_variable('stateEstimate.z', 'float')
-        log_conf.add_variable('stabilizer.roll', 'float')
-        log_conf.add_variable('stabilizer.pitch', 'float')
-        log_conf.add_variable('stabilizer.yaw', 'float')
-        log_conf.add_variable('range.zrange', 'uint16_t')  # Flow deck height
+        """Setup logging configuration for state estimation and fpga data."""
+        log_conf = LogConfig(name='StateFpga', period_in_ms=self.log_period_ms)
+        # Fetch state/attitude as FP16 to fit in one log packet with fpga values.
+        log_conf.add_variable('stateEstimate.x', 'FP16')
+        log_conf.add_variable('stateEstimate.y', 'FP16')
+        log_conf.add_variable('stateEstimate.z', 'FP16')
+        log_conf.add_variable('stabilizer.roll', 'FP16')
+        log_conf.add_variable('stabilizer.pitch', 'FP16')
+        log_conf.add_variable('stabilizer.yaw', 'FP16')
+        log_conf.add_variable('fpga.u1_16', 'int16_t')
+        log_conf.add_variable('fpga.u2_16', 'int16_t')
+        log_conf.add_variable('fpga.u3_16', 'int16_t')
+        log_conf.add_variable('fpga.u4_16', 'int16_t')
         
         try:
             cf.log.add_config(log_conf)
-            log_conf.data_received_cb.add_callback(self._log_callback)
+            log_conf.data_received_cb.add_callback(self._state_log_callback)
             log_conf.start()
-            logger.info("Logging started")
+            self.log_conf = log_conf
+            logger.info(
+                "Logging started: stateEstimate/stabilizer=FP16, fpga.u1_16..u4_16=int16_t "
+                f"at {int(1000 / self.log_period_ms)} Hz"
+            )
         except KeyError as e:
             logger.error(f'Could not start log configuration: {e}')
         except AttributeError as e:
@@ -208,15 +225,78 @@ class CrazyflieController:
         msg = f"[CF_CONSOLE] {text}"
         print(msg)
     
-    def _log_callback(self, timestamp, data, logconf):
-        """Callback for logging data"""
+    def _state_log_callback(self, timestamp, data, logconf):
+        """Callback for state logging data."""
         self.log_data.update(data)
-        height_mm = data.get('range.zrange', 0)
-        height_m = height_mm / 1000.0
-        logger.info(f"[STATE] x={data['stateEstimate.x']:.3f} y={data['stateEstimate.y']:.3f} "
-                   f"z={data['stateEstimate.z']:.3f} height={height_m:.3f}m | "
-                   f"roll={data['stabilizer.roll']:.2f} pitch={data['stabilizer.pitch']:.2f} "
-                   f"yaw={data['stabilizer.yaw']:.2f}")
+        now = time.time()
+        if now - self.last_state_print_time >= 0.2:  # 5Hz console print
+            self.last_state_print_time = now
+            logger.info(f"[STATE] x={data['stateEstimate.x']:.3f} y={data['stateEstimate.y']:.3f} "
+                       f"z={data['stateEstimate.z']:.3f} | "
+                       f"roll={data['stabilizer.roll']:.2f} pitch={data['stabilizer.pitch']:.2f} "
+                       f"yaw={data['stabilizer.yaw']:.2f}")
+        self._write_csv_row()
+    
+    def start_csv_logging(self):
+        """Enable CSV logging to a new file."""
+        if self.csv_logging_enabled and self.csv_log_file is not None:
+            logger.info("CSV logging is already enabled")
+            return
+        
+        ts = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')
+        csv_log_path = f"cf_log_{ts}.csv"
+        try:
+            self.csv_log_file = open(csv_log_path, 'w')
+            self.csv_log_file.write(
+                "time_wall,time_ms,state_x,state_y,state_z,roll,pitch,yaw,"
+                "u1_16,u2_16,u3_16,u4_16\n"
+            )
+            self.csv_log_file.flush()
+            self.csv_logging_enabled = True
+            logger.info(
+                f"CSV logging enabled -> {csv_log_path} "
+                f"(state/attitude + fpga.u1_16..u4_16)"
+            )
+            if self.disable_setpoint_while_csv_logging:
+                logger.info("Setpoint transmission paused while CSV logging is enabled")
+        except OSError as e:
+            logger.error(f"Could not open CSV log file {csv_log_path}: {e}")
+            self.csv_log_file = None
+            self.csv_logging_enabled = False
+    
+    def stop_csv_logging(self):
+        """Disable CSV logging and close file."""
+        if self.csv_log_file is not None:
+            try:
+                self.csv_log_file.close()
+            except OSError:
+                pass
+        self.csv_log_file = None
+        if self.csv_logging_enabled:
+            logger.info("CSV logging disabled")
+            if self.disable_setpoint_while_csv_logging:
+                logger.info("Setpoint transmission resumed")
+        self.csv_logging_enabled = False
+    
+    def _write_csv_row(self):
+        """Write one CSV row using latest state + fpga values."""
+        if not self.csv_logging_enabled or self.csv_log_file is None:
+            return
+        now = time.time()
+        self.csv_log_file.write(
+            f"{datetime.now().astimezone().isoformat()},{now * 1000.0:.3f},"
+            f"{self.log_data.get('stateEstimate.x', 0.0):.6f},"
+            f"{self.log_data.get('stateEstimate.y', 0.0):.6f},"
+            f"{self.log_data.get('stateEstimate.z', 0.0):.6f},"
+            f"{self.log_data.get('stabilizer.roll', 0.0):.6f},"
+            f"{self.log_data.get('stabilizer.pitch', 0.0):.6f},"
+            f"{self.log_data.get('stabilizer.yaw', 0.0):.6f},"
+            f"{int(self.log_data.get('fpga.u1_16', 0))},"
+            f"{int(self.log_data.get('fpga.u2_16', 0))},"
+            f"{int(self.log_data.get('fpga.u3_16', 0))},"
+            f"{int(self.log_data.get('fpga.u4_16', 0))}\n"
+        )
+        self.csv_log_file.flush()
         
     def set_parameters(self, cf, param_dict):
         """
@@ -263,6 +343,8 @@ class CrazyflieController:
             logger.info("  0 = reset yaw reference (drone must face +X)")
             logger.info("  g = go to trajectory zero point (trajectory_offset)")
             logger.info("  T = play trajectory from CSV (time_ms, dx, dy, dz, dyaw) using configured offset")
+            logger.info("  S = start CSV logging (EKF + fpga.u1_16..u4_16)")
+            logger.info("  X = stop CSV logging")
             logger.info("  1 = switch to PID controller")
             logger.info("  6 = switch to INDI controller")
             logger.info("  q = quit and land")
@@ -278,6 +360,8 @@ class CrazyflieController:
             logger.info("  +/- = adjust target height")
             logger.info("  w/s = forward/backward")
             logger.info("  a/d = left/right")
+            logger.info("  S = start CSV logging (EKF + fpga.u1_16..u4_16)")
+            logger.info("  X = stop CSV logging")
             logger.info("  1 = switch to PID controller")
             logger.info("  6 = switch to INDI controller")
             logger.info("  q = quit and land")
@@ -361,6 +445,10 @@ class CrazyflieController:
                 
                 # Send setpoint at 50Hz based on state and mode
                 if current_time - self.last_setpoint_time >= self.setpoint_rate:
+                    if self.csv_logging_enabled and self.disable_setpoint_while_csv_logging:
+                        self.last_setpoint_time = current_time
+                        time.sleep(0.001)
+                        continue
                     try:
                         if self.use_mocap:
                             # MOCAP MODE - Use absolute position setpoints
@@ -466,6 +554,7 @@ class CrazyflieController:
                 except OSError:
                     pass
                 self.mocap_log_file = None
+            self.stop_csv_logging()
             # Restore terminal settings
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             # Send stop command
@@ -553,6 +642,12 @@ class CrazyflieController:
                 logger.info(f"↻ Yaw right to {self.target_yaw:.1f}°")
         
         # Controller switching
+        elif key == 'S':
+            self.start_csv_logging()
+        
+        elif key == 'X':
+            self.stop_csv_logging()
+        
         elif key == '1':
             try:
                 cf.param.set_value('stabilizer.controller', 1)
@@ -598,7 +693,7 @@ class CrazyflieController:
                     self.trajectory_next_index = 0
                     self.state = 'PLAYING_TRAJECTORY'
                     self.trajectory_start_time = time.time()
-                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    ts = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')
                     mocap_log_path = f"mocap_log_{ts}.csv"
                     try:
                         self.mocap_log_file = open(mocap_log_path, 'w')

@@ -11,7 +11,7 @@ plot_filename = "trajectory.png"
 # Parameters
 radius = 0.6         # horizontal size of the infinity loop [m]
 z_height = 0.0       # constant altitude [m]
-duration = 15.0      # total duration [s]
+duration =  8.0      # total duration [s]
 num_points = 200     # number of setpoints
 yaw = 0.0            # constant yaw [deg]
 
