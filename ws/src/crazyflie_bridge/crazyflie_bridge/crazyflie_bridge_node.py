@@ -22,7 +22,7 @@ from geometry_msgs.msg import PoseStamped
 import threading
 
 # Crazyflie URI
-URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E8')
 DELTA = 0.10
 def quaternion_to_yaw(qx, qy, qz, qw):
     """Extract yaw (rotation around Z) from quaternion in radians."""
@@ -147,11 +147,14 @@ class CrazyflieController:
         }
         self.log_conf = None
         self.last_state_print_time = 0.0
+        self.log_packets_received = 0
+        self.last_no_log_warning_time = 0.0
         
         # Manual CSV logging (enabled/disabled with keyboard command)
         self.csv_log_file = None
         self.csv_logging_enabled = False
         self.disable_setpoint_while_csv_logging = False
+        self.latest_mocap = None  # (time_ms, x, y, z, qx, qy, qz, qw, mode)
         
     def _param_callback(self, name, value):
         logger.info(f'Parameter {name} set to {value}')
@@ -192,6 +195,26 @@ class CrazyflieController:
     
     def setup_logging(self, cf):
         """Setup logging configuration for state estimation and fpga data."""
+        required_vars = [
+            'stateEstimate.x',
+            'stateEstimate.y',
+            'stateEstimate.z',
+            'stabilizer.roll',
+            'stabilizer.pitch',
+            'stabilizer.yaw',
+            'fpga.u1_16',
+            'fpga.u2_16',
+            'fpga.u3_16',
+            'fpga.u4_16',
+        ]
+        missing = [v for v in required_vars if not self._log_var_exists(cf, v)]
+        if missing:
+            logger.error(
+                "Cannot start log block; missing log variables in TOC: "
+                + ", ".join(missing)
+            )
+            return
+
         log_conf = LogConfig(name='StateFpga', period_in_ms=self.log_period_ms)
         # Fetch state/attitude as FP16 to fit in one log packet with fpga values.
         log_conf.add_variable('stateEstimate.x', 'FP16')
@@ -208,6 +231,7 @@ class CrazyflieController:
         try:
             cf.log.add_config(log_conf)
             log_conf.data_received_cb.add_callback(self._state_log_callback)
+            log_conf.error_cb.add_callback(self._log_error_callback)
             log_conf.start()
             self.log_conf = log_conf
             logger.info(
@@ -218,6 +242,30 @@ class CrazyflieController:
             logger.error(f'Could not start log configuration: {e}')
         except AttributeError as e:
             logger.error(f'Could not add log config: {e}')
+        except Exception as e:
+            logger.exception(f'Unexpected error while starting log configuration: {e}')
+    
+    def _log_var_exists(self, cf, complete_name):
+        """Best-effort check if a log variable exists in the Crazyflie log TOC."""
+        toc = getattr(getattr(cf, 'log', None), 'toc', None)
+        if toc is None:
+            return False
+        get_by_name = getattr(toc, 'get_element_by_complete_name', None)
+        if callable(get_by_name):
+            try:
+                return get_by_name(complete_name) is not None
+            except Exception:
+                pass
+        toc_tree = getattr(toc, 'toc', None)
+        if isinstance(toc_tree, dict):
+            try:
+                group, var = complete_name.split('.', 1)
+            except ValueError:
+                return False
+            group_entry = toc_tree.get(group)
+            if isinstance(group_entry, dict):
+                return var in group_entry
+        return False
     
         
     def _console_callback(self, text):
@@ -227,15 +275,27 @@ class CrazyflieController:
     
     def _state_log_callback(self, timestamp, data, logconf):
         """Callback for state logging data."""
-        self.log_data.update(data)
-        now = time.time()
-        if now - self.last_state_print_time >= 0.2:  # 5Hz console print
-            self.last_state_print_time = now
-            logger.info(f"[STATE] x={data['stateEstimate.x']:.3f} y={data['stateEstimate.y']:.3f} "
-                       f"z={data['stateEstimate.z']:.3f} | "
-                       f"roll={data['stabilizer.roll']:.2f} pitch={data['stabilizer.pitch']:.2f} "
-                       f"yaw={data['stabilizer.yaw']:.2f}")
-        self._write_csv_row()
+        try:
+            self.log_packets_received += 1
+            self.log_data.update(data)
+            now = time.time()
+            if now - self.last_state_print_time >= 0.2:  # 5Hz console print
+                self.last_state_print_time = now
+                logger.info(
+                    f"[STATE] x={self.log_data.get('stateEstimate.x', 0.0):.3f} "
+                    f"y={self.log_data.get('stateEstimate.y', 0.0):.3f} "
+                    f"z={self.log_data.get('stateEstimate.z', 0.0):.3f} | "
+                    f"roll={self.log_data.get('stabilizer.roll', 0.0):.2f} "
+                    f"pitch={self.log_data.get('stabilizer.pitch', 0.0):.2f} "
+                    f"yaw={self.log_data.get('stabilizer.yaw', 0.0):.2f}"
+                )
+            self._write_csv_row()
+        except Exception as e:
+            logger.exception(f"Exception in log callback: {e}")
+    
+    def _log_error_callback(self, logconf, msg):
+        """Callback for Crazyflie log block runtime errors."""
+        logger.error(f"[CF_LOG_ERROR] {logconf.name}: {msg}")
     
     def start_csv_logging(self):
         """Enable CSV logging to a new file."""
@@ -249,7 +309,8 @@ class CrazyflieController:
             self.csv_log_file = open(csv_log_path, 'w')
             self.csv_log_file.write(
                 "time_wall,time_ms,state_x,state_y,state_z,roll,pitch,yaw,"
-                "u1_16,u2_16,u3_16,u4_16\n"
+                "u1_16,u2_16,u3_16,u4_16,"
+                "mocap_time_ms,mocap_x,mocap_y,mocap_z,mocap_qx,mocap_qy,mocap_qz,mocap_qw,mocap_mode\n"
             )
             self.csv_log_file.flush()
             self.csv_logging_enabled = True
@@ -283,6 +344,14 @@ class CrazyflieController:
         if not self.csv_logging_enabled or self.csv_log_file is None:
             return
         now = time.time()
+        mocap = self.latest_mocap
+        if mocap is None:
+            mocap_time_ms = float('nan')
+            mx = my = mz = float('nan')
+            mqx = mqy = mqz = mqw = float('nan')
+            mmode = ''
+        else:
+            mocap_time_ms, mx, my, mz, mqx, mqy, mqz, mqw, mmode = mocap
         self.csv_log_file.write(
             f"{datetime.now().astimezone().isoformat()},{now * 1000.0:.3f},"
             f"{self.log_data.get('stateEstimate.x', 0.0):.6f},"
@@ -294,7 +363,11 @@ class CrazyflieController:
             f"{int(self.log_data.get('fpga.u1_16', 0))},"
             f"{int(self.log_data.get('fpga.u2_16', 0))},"
             f"{int(self.log_data.get('fpga.u3_16', 0))},"
-            f"{int(self.log_data.get('fpga.u4_16', 0))}\n"
+            f"{int(self.log_data.get('fpga.u4_16', 0))},"
+            f"{mocap_time_ms:.3f},"
+            f"{mx:.6f},{my:.6f},{mz:.6f},"
+            f"{mqx:.6f},{mqy:.6f},{mqz:.6f},{mqw:.6f},"
+            f"{mmode}\n"
         )
         self.csv_log_file.flush()
         
@@ -378,6 +451,12 @@ class CrazyflieController:
             
             while True:
                 current_time = time.time()
+                if self.log_packets_received == 0 and (current_time - self.last_no_log_warning_time) >= 1.0:
+                    self.last_no_log_warning_time = current_time
+                    logger.warning(
+                        "No log packets received yet (state/fpga). "
+                        "CSV will stay header-only until log callback starts."
+                    )
                 
                 # Check for keyboard input (non-blocking)
                 if select.select([sys.stdin], [], [], 0)[0]:
@@ -397,6 +476,9 @@ class CrazyflieController:
                         try:
                             x, y, z, qx, qy, qz, qw, mode = mocap_func()
                             if x > -25.0:  # Check for valid mocap data
+                                self.latest_mocap = (
+                                    current_time * 1000.0, x, y, z, qx, qy, qz, qw, mode
+                                )
                                 # Log mocap to CSV while playing trajectory
                                 if self.state == 'PLAYING_TRAJECTORY' and self.mocap_log_file is not None and self.trajectory_origin is not None:
                                     elapsed_ms = (current_time - self.trajectory_start_time) * 1000.0
