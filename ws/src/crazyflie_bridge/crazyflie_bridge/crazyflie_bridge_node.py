@@ -22,7 +22,7 @@ from geometry_msgs.msg import PoseStamped
 import threading
 
 # Crazyflie URI
-URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E8')
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 DELTA = 0.10
 def quaternion_to_yaw(qx, qy, qz, qw):
     """Extract yaw (rotation around Z) from quaternion in radians."""
@@ -118,12 +118,11 @@ class CrazyflieController:
         # Current mocap pose (updated from external source)
         self.current_yaw = 0.0  # Current yaw from mocap in radians
         
-        # Trajectory playback: waypoints (relative), origin, start time, next index, mocap log file
+        # Trajectory playback: waypoints (relative), origin, start time, next index
         self.trajectory_waypoints = []
         self.trajectory_origin = None  # (x, y, z, yaw_deg) in world frame when trajectory started
         self.trajectory_start_time = 0.0
         self.trajectory_next_index = 0  # next CSV line to apply when its time is reached
-        self.mocap_log_file = None
         
         # Timing control
         self.last_extpos_time = 0
@@ -140,10 +139,10 @@ class CrazyflieController:
             'stabilizer.roll': 0,
             'stabilizer.pitch': 0,
             'stabilizer.yaw': 0,
-            'fpga.u1_16': 0,
-            'fpga.u2_16': 0,
-            'fpga.u3_16': 0,
-            'fpga.u4_16': 0,
+#            'fpga.u1_16': 0,
+#            'fpga.u2_16': 0,
+#            'fpga.u3_16': 0,
+#            'fpga.u4_16': 0,
         }
         self.log_conf = None
         self.last_state_print_time = 0.0
@@ -153,8 +152,10 @@ class CrazyflieController:
         # Manual CSV logging (enabled/disabled with keyboard command)
         self.csv_log_file = None
         self.csv_logging_enabled = False
+        self.csv_logging_auto_started = False
         self.disable_setpoint_while_csv_logging = False
         self.latest_mocap = None  # (time_ms, x, y, z, qx, qy, qz, qw, mode)
+        self.current_controller = 1  # 1=PID, 6=INDI/FPGA
         
     def _param_callback(self, name, value):
         logger.info(f'Parameter {name} set to {value}')
@@ -202,10 +203,10 @@ class CrazyflieController:
             'stabilizer.roll',
             'stabilizer.pitch',
             'stabilizer.yaw',
-            'fpga.u1_16',
-            'fpga.u2_16',
-            'fpga.u3_16',
-            'fpga.u4_16',
+#            'fpga.u1_16',
+#            'fpga.u2_16',
+#            'fpga.u3_16',
+#            'fpga.u4_16',
         ]
         missing = [v for v in required_vars if not self._log_var_exists(cf, v)]
         if missing:
@@ -223,10 +224,10 @@ class CrazyflieController:
         log_conf.add_variable('stabilizer.roll', 'FP16')
         log_conf.add_variable('stabilizer.pitch', 'FP16')
         log_conf.add_variable('stabilizer.yaw', 'FP16')
-        log_conf.add_variable('fpga.u1_16', 'int16_t')
-        log_conf.add_variable('fpga.u2_16', 'int16_t')
-        log_conf.add_variable('fpga.u3_16', 'int16_t')
-        log_conf.add_variable('fpga.u4_16', 'int16_t')
+#        log_conf.add_variable('fpga.u1_16', 'int16_t')
+#        log_conf.add_variable('fpga.u2_16', 'int16_t')
+#        log_conf.add_variable('fpga.u3_16', 'int16_t')
+#        log_conf.add_variable('fpga.u4_16', 'int16_t')
         
         try:
             cf.log.add_config(log_conf)
@@ -310,6 +311,8 @@ class CrazyflieController:
             self.csv_log_file.write(
                 "time_wall,time_ms,state_x,state_y,state_z,roll,pitch,yaw,"
                 "u1_16,u2_16,u3_16,u4_16,"
+                "controller_id,"
+                "setpoint_x,setpoint_y,setpoint_z,setpoint_yaw_deg,"
                 "mocap_time_ms,mocap_x,mocap_y,mocap_z,mocap_qx,mocap_qy,mocap_qz,mocap_qw,mocap_mode\n"
             )
             self.csv_log_file.flush()
@@ -352,6 +355,15 @@ class CrazyflieController:
             mmode = ''
         else:
             mocap_time_ms, mx, my, mz, mqx, mqy, mqz, mqw, mmode = mocap
+
+        if self.use_mocap and self.state in ['TAKING_OFF', 'FLYING', 'LANDING', 'PLAYING_TRAJECTORY']:
+            spx = self.target_x
+            spy = self.target_y
+            spz = self.target_z
+            spyaw = self.target_yaw
+        else:
+            spx = spy = spz = spyaw = float('nan')
+
         self.csv_log_file.write(
             f"{datetime.now().astimezone().isoformat()},{now * 1000.0:.3f},"
             f"{self.log_data.get('stateEstimate.x', 0.0):.6f},"
@@ -364,6 +376,8 @@ class CrazyflieController:
             f"{int(self.log_data.get('fpga.u2_16', 0))},"
             f"{int(self.log_data.get('fpga.u3_16', 0))},"
             f"{int(self.log_data.get('fpga.u4_16', 0))},"
+            f"{int(self.current_controller)},"
+            f"{spx:.6f},{spy:.6f},{spz:.6f},{spyaw:.6f},"
             f"{mocap_time_ms:.3f},"
             f"{mx:.6f},{my:.6f},{mz:.6f},"
             f"{mqx:.6f},{mqy:.6f},{mqz:.6f},{mqw:.6f},"
@@ -381,6 +395,11 @@ class CrazyflieController:
         for param_name, value in param_dict.items():
             try:
                 cf.param.set_value(param_name, value)
+                if param_name == 'stabilizer.controller':
+                    try:
+                        self.current_controller = int(value)
+                    except (TypeError, ValueError):
+                        pass
                 logger.info(f"Set {param_name} = {value}")
                 time.sleep(0.1)
             except Exception as e:
@@ -479,28 +498,6 @@ class CrazyflieController:
                                 self.latest_mocap = (
                                     current_time * 1000.0, x, y, z, qx, qy, qz, qw, mode
                                 )
-                                # Log mocap to CSV while playing trajectory
-                                if self.state == 'PLAYING_TRAJECTORY' and self.mocap_log_file is not None and self.trajectory_origin is not None:
-                                    elapsed_ms = (current_time - self.trajectory_start_time) * 1000.0
-                                    ox, oy, oz, oyaw = self.trajectory_origin
-                                    yaw_rad = quaternion_to_yaw(qx, qy, qz, qw)
-                                    yaw_deg = math.degrees(yaw_rad)
-                                    rel_yaw = yaw_deg - oyaw
-                                    if rel_yaw > 180:
-                                        rel_yaw -= 360
-                                    elif rel_yaw < -180:
-                                        rel_yaw += 360
-                                    sp_rel_yaw = self.target_yaw - oyaw
-                                    if sp_rel_yaw > 180:
-                                        sp_rel_yaw -= 360
-                                    elif sp_rel_yaw < -180:
-                                        sp_rel_yaw += 360
-                                    self.mocap_log_file.write(
-                                        f"{elapsed_ms:.2f},{x - ox:.6f},{y - oy:.6f},{z - oz:.6f},{rel_yaw:.4f},"
-                                        f"{self.target_x - ox:.6f},{self.target_y - oy:.6f},{self.target_z - oz:.6f},"
-                                        f"{sp_rel_yaw:.4f}\n"
-                                    )
-                                    self.mocap_log_file.flush()
                                 if mode == 'position_only':
                                     # SINGLE MARKER MODE
                                     # Only send position - IMU handles all orientation
@@ -555,9 +552,9 @@ class CrazyflieController:
                                     self.state = 'FLYING'
                                     self.trajectory_origin = None
                                     self.trajectory_next_index = 0
-                                    if self.mocap_log_file is not None:
-                                        self.mocap_log_file.close()
-                                        self.mocap_log_file = None
+                                    if self.csv_logging_auto_started:
+                                        self.stop_csv_logging()
+                                        self.csv_logging_auto_started = False
                                     logger.info("✓ Trajectory playback finished")
                             
                             if self.state == 'TAKING_OFF':
@@ -630,12 +627,7 @@ class CrazyflieController:
         except KeyboardInterrupt:
             logger.info("Control loop interrupted")
         finally:
-            if self.mocap_log_file is not None:
-                try:
-                    self.mocap_log_file.close()
-                except OSError:
-                    pass
-                self.mocap_log_file = None
+            self.csv_logging_auto_started = False
             self.stop_csv_logging()
             # Restore terminal settings
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
@@ -733,6 +725,7 @@ class CrazyflieController:
         elif key == '1':
             try:
                 cf.param.set_value('stabilizer.controller', 1)
+                self.current_controller = 1
                 logger.info("🎮 Switched to PID controller (1)")
             except Exception as e:
                 logger.error(f"Failed to set controller: {e}")
@@ -740,6 +733,7 @@ class CrazyflieController:
         elif key == '6':
             try:
                 cf.param.set_value('stabilizer.controller', 6)
+                self.current_controller = 6
                 logger.info("🎮 Switched to FPGA controller (6)")
             except Exception as e:
                 logger.error(f"Failed to set controller: {e}")
@@ -775,22 +769,16 @@ class CrazyflieController:
                     self.trajectory_next_index = 0
                     self.state = 'PLAYING_TRAJECTORY'
                     self.trajectory_start_time = time.time()
-                    ts = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')
-                    mocap_log_path = f"mocap_log_{ts}.csv"
-                    try:
-                        self.mocap_log_file = open(mocap_log_path, 'w')
-                        self.mocap_log_file.write(
-                            "time_ms,x,y,z,yaw_deg,sp_x,sp_y,sp_z,sp_yaw_deg\n"
-                        )
-                        self.mocap_log_file.flush()
-                        logger.info(
-                            f"▶ Playing trajectory from {self.trajectory_file} "
-                            f"(offset={self.trajectory_offset}), "
-                            f"logging mocap+setpoint (relative) to {mocap_log_path}"
-                        )
-                    except OSError as e:
-                        logger.error(f"Could not open mocap log file {mocap_log_path}: {e}")
-                        self.mocap_log_file = None
+                    if self.csv_logging_enabled:
+                        self.csv_logging_auto_started = False
+                    else:
+                        self.start_csv_logging()
+                        self.csv_logging_auto_started = self.csv_logging_enabled
+                    logger.info(
+                        f"▶ Playing trajectory from {self.trajectory_file} "
+                        f"(offset={self.trajectory_offset}), "
+                        "logging state+mocap+setpoint to CSV"
+                    )
             else:
                 logger.warning("⚠ Start trajectory only when FLYING with mocap (press T)")
         
@@ -896,7 +884,7 @@ class CrazyflieROS2Node(Node):
         # Trajectory offset [x, y, z, yaw_deg] in world frame.
         # Each CSV point is applied as: world_target = trajectory_offset + trajectory_point.
         # Trajectory point (0, 0, 0, 0) is located at trajectory_offset.
-        self.declare_parameter('trajectory_offset', [0.45, -0.55, 0.3, 0.0])
+        self.declare_parameter('trajectory_offset', [0.35, 1.05, 0.3, 0.0]) #[0.0, -0.55, 0.6, 0.0])
         # x=0.390 y=-0.582 z=0.517
         # Get parameters
         self.uri = self.get_parameter('uri').value
