@@ -25,23 +25,21 @@ public:
     OptiTrackNode() : Node("optitrack_node")
     {
         // Declare parameters
-        this->declare_parameter<std::string>("server_address", "10.10.30.123");
-        this->declare_parameter<std::string>("local_address", "10.10.30.3");
-        this->declare_parameter<std::string>("multicast_address", "239.255.42.99");
+        this->declare_parameter<std::string>("server_address", "10.10.30.3");
+        this->declare_parameter<std::string>("local_address", "10.10.30.2");
         this->declare_parameter<int>("command_port", 1510);
         this->declare_parameter<int>("data_port", 1511);
         this->declare_parameter<int>("rigid_body_id", -1);
         this->declare_parameter<std::string>("world_frame", "world");
-        
-        // Tracking mode: "rigid_body" (default) or "marker" (single marker tracking)
-        this->declare_parameter<std::string>("tracking_mode", "marker");
+
+        // Tracking mode: "rigid_body", "marker" (single marker tracking), or "both"
+        this->declare_parameter<std::string>("tracking_mode", "both");
         // Marker ID to track (-1 = track largest marker by size)
         this->declare_parameter<int>("marker_id", -1);
 
         // Get parameters
         server_address_ = this->get_parameter("server_address").as_string();
         local_address_ = this->get_parameter("local_address").as_string();
-        multicast_address_ = this->get_parameter("multicast_address").as_string();
         command_port_ = this->get_parameter("command_port").as_int();
         data_port_ = this->get_parameter("data_port").as_int();
         rigid_body_id_ = this->get_parameter("rigid_body_id").as_int();
@@ -78,9 +76,9 @@ public:
 
         // Log tracking mode
         RCLCPP_INFO(this->get_logger(), "Tracking mode: %s", tracking_mode_.c_str());
-        if (tracking_mode_ == "marker") {
+        if (tracking_mode_ == "marker" || tracking_mode_ == "both") {
             if (marker_id_ == -1) {
-                RCLCPP_INFO(this->get_logger(), "Will track largest marker by size");
+                RCLCPP_INFO(this->get_logger(), "Will track largest unlabeled marker by size");
             } else {
                 RCLCPP_INFO(this->get_logger(), "Will track marker ID: %d", marker_id_);
             }
@@ -88,6 +86,10 @@ public:
             marker_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
                 "optitrack/marker/pose", 10);
             RCLCPP_INFO(this->get_logger(), "Created marker publisher on topic: optitrack/marker/pose");
+        }
+
+        if (tracking_mode_ == "rigid_body" || tracking_mode_ == "both") {
+            RCLCPP_INFO(this->get_logger(), "Rigid body tracking enabled");
         }
 
         RCLCPP_INFO(this->get_logger(), "OptiTrack ROS2 node initialized and ready");
@@ -110,11 +112,11 @@ public:
         auto timestamp = this->now();
 
         // Process based on tracking mode
-        if (tracking_mode_ == "marker") {
-            // MARKER TRACKING MODE - track individual markers
+        if (tracking_mode_ == "marker" || tracking_mode_ == "both") {
             processMarkers(data, timestamp);
-        } else {
-            // RIGID BODY TRACKING MODE (default)
+        }
+        
+        if (tracking_mode_ == "rigid_body" || tracking_mode_ == "both") {
             processRigidBodies(data, timestamp);
         }
     }
@@ -122,7 +124,7 @@ public:
     void processMarkers(sFrameOfMocapData* data, const rclcpp::Time& timestamp)
     {
         // Debug: log number of markers periodically
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
             "Labeled markers: %d, Unlabeled markers: %d",
             data->nLabeledMarkers, data->nOtherMarkers);
         
@@ -135,13 +137,21 @@ public:
             
             // Check if marker is occluded (bit 0)
             bool occluded = (m.params & 0x01) != 0;
+            // Check if marker is unlabeled (bit 4)
+            bool unlabeled = (m.params & 0x10) != 0;
             
             // Debug: log marker info periodically
             RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "Marker ID=%d, Pos=(%.3f,%.3f,%.3f), Size=%.4f, Occluded=%d, Params=0x%04x",
-                m.ID, m.x, m.y, m.z, m.size, occluded, m.params);
+                "Marker ID=%d, Pos=(%.3f,%.3f,%.3f), Size=%.4f, Occluded=%d, Unlabeled=%d, Params=0x%04x",
+                m.ID, m.x, m.y, m.z, m.size, occluded, unlabeled, m.params);
             
             if (occluded) {
+                continue;
+            }
+
+            // If tracking the "largest" marker (marker_id_ == -1), we only consider unlabeled ones
+            // to avoid jumping to a marker that is part of a rigid body.
+            if (marker_id_ == -1 && !unlabeled) {
                 continue;
             }
             
@@ -339,7 +349,6 @@ private:
     // Parameters
     std::string server_address_;
     std::string local_address_;
-    std::string multicast_address_;
     int command_port_;
     int data_port_;
     int rigid_body_id_;
