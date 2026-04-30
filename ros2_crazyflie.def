@@ -1,0 +1,23 @@
+Bootstrap: docker
+From: osrf/ros:humble-desktop
+
+%post
+    apt-get update && apt-get install --no-install-recommends -y \
+        ros-humble-rosbag2-storage-mcap \
+        python3-pyqtgraph \
+        python3-pip \
+        python3-setuptools
+    
+    pip3 install cflib cfclient autograd
+    apt-get clean autoclean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export ROS_DOMAIN_ID=132
+    . /opt/ros/humble/setup.sh
+
+    # Dynamically find and source the workspace if we are inside the project dir
+    # This looks for the install folder relative to where you start the container
+    if [ -f "./ws/install/setup.bash" ]; then
+        . ./ws/install/setup.bash
+    fi
