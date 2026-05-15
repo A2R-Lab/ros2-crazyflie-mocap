@@ -12,3 +12,6 @@ run:
 
 attach:
 	apptainer exec instance://$(INSTANCE_NAME) /bin/bash
+
+stop:
+	apptainer instance stop $(INSTANCE_NAME)

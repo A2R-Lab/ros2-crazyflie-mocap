@@ -18,6 +18,6 @@ From: osrf/ros:humble-desktop
 
     # Dynamically find and source the workspace if we are inside the project dir
     # This looks for the install folder relative to where you start the container
-    if [ -f "./ws/install/setup.bash" ]; then
-        . ./ws/install/setup.bash
+    if [ -f "./ws/install/setup.sh" ]; then
+        . ./ws/install/setup.sh
     fi
