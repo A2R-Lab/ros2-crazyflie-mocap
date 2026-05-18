@@ -7,11 +7,11 @@ build:
 run:
 	@# Start the background instance (automatically sees your $HOME)
 	@apptainer instance start $(IMAGE_NAME) $(INSTANCE_NAME) || true
-	apptainer shell instance://$(INSTANCE_NAME)
+	apptainer shell --env HISTFILE=./.bash_history instance://$(INSTANCE_NAME)
 	@apptainer instance stop $(INSTANCE_NAME)
 
 attach:
-	apptainer exec instance://$(INSTANCE_NAME) /bin/bash
+	apptainer exec --env HISTFILE=./.bash_history instance://$(INSTANCE_NAME) /bin/bash
 
 stop:
 	apptainer instance stop $(INSTANCE_NAME)
