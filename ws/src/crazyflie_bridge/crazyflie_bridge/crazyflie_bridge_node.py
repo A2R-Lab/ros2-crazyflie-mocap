@@ -26,6 +26,7 @@ import threading
 # Crazyflie URI
 URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 DELTA = 0.10
+OBSTACLE_MARGIN_M = 0.20
 def quaternion_to_yaw(qx, qy, qz, qw):
     """Extract yaw (rotation around Z) from quaternion in radians."""
     # Yaw (z-axis rotation)
@@ -1020,8 +1021,14 @@ class CrazyflieROS2Node(Node):
                 # Transform box X coordinates using the same mapping as the drone
                 b1_x = self.axis_sign[0] * box1_raw[self.axis_mapping[0]]
                 b2_x = self.axis_sign[0] * box2_raw[self.axis_mapping[0]]
-                box_min = min(b1_x, b2_x)
-                box_max = max(b1_x, b2_x)
+                raw_box_min = min(b1_x, b2_x)
+                raw_box_max = max(b1_x, b2_x)
+                box_min = raw_box_min + OBSTACLE_MARGIN_M
+                box_max = raw_box_max - OBSTACLE_MARGIN_M
+                if box_min > box_max:
+                    midpoint = 0.5 * (raw_box_min + raw_box_max)
+                    box_min = midpoint
+                    box_max = midpoint
                 now = time.time()
                 if now - self.last_box_log_time >= 2.0:
                     self.get_logger().info(
@@ -1029,6 +1036,7 @@ class CrazyflieROS2Node(Node):
                         f"box1=({box1_raw[0]:.3f}, {box1_raw[1]:.3f}, {box1_raw[2]:.3f}) m, "
                         f"box2=({box2_raw[0]:.3f}, {box2_raw[1]:.3f}, {box2_raw[2]:.3f}) m | "
                         f"constraint_x: box1={b1_x:.3f} m, box2={b2_x:.3f} m, "
+                        f"margin={OBSTACLE_MARGIN_M:.2f} m, "
                         f"min={box_min:.3f} m, max={box_max:.3f} m"
                     )
                     self.last_box_log_time = now
