@@ -1,1165 +1,1582 @@
 #!/usr/bin/env python3
 
+import atexit
 import csv
 import logging
-import os
-import atexit
-import time
-import sys
-import select
-import termios
-import tty
 import math
-import struct
+import select
+import sys
+import termios
+import threading
+import time
+import traceback
+import tty
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
-from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.crazyflie.log import LogConfig
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.utils import uri_helper
+from cflib.utils.encoding import decompress_quaternion
 
 import rclpy
-from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-import threading
+from rclpy.node import Node
 
-# Crazyflie URI
-URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
-DELTA = 0.10
-OBSTACLE_MARGIN_M = 0.20
-def quaternion_to_yaw(qx, qy, qz, qw):
-    """Extract yaw (rotation around Z) from quaternion in radians."""
-    # Yaw (z-axis rotation)
+
+URI = uri_helper.uri_from_env(default="radio://0/80/2M/E7E7E7E7E7")
+
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
+
+
+def quaternion_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-def world_to_body_velocity(vx_world, vy_world, yaw):
-    """
-    Transform velocity from world frame to body frame.
-    yaw: current heading in radians
-    """
-    cos_yaw = math.cos(yaw)
-    sin_yaw = math.sin(yaw)
-    vx_body = cos_yaw * vx_world + sin_yaw * vy_world
-    vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
-    return vx_body, vy_body
+def yaw_to_quaternion(yaw_rad: float) -> Tuple[float, float, float, float]:
+    half_yaw = 0.5 * yaw_rad
+    return 0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw)
 
 
-def body_to_world_displacement(dx_body, dy_body, yaw):
-    """
-    Transform displacement from body frame to world frame.
-    dx_body: forward displacement in body frame
-    dy_body: left displacement in body frame  
-    yaw: current heading in radians
-    """
-    cos_yaw = math.cos(yaw)
-    sin_yaw = math.sin(yaw)
-    dx_world = cos_yaw * dx_body - sin_yaw * dy_body
-    dy_world = sin_yaw * dx_body + cos_yaw * dy_body
-    return dx_world, dy_world
-
-
-def apply_yaw_offset_to_quaternion(qx, qy, qz, qw, yaw_offset):
-    """
-    Apply a yaw (Z-axis) rotation offset to a quaternion.
-    This is used to correct for rigid body creation orientation in OptiTrack.
-    yaw_offset: rotation offset in radians
-    """
-    # Create rotation quaternion for yaw offset (rotation around Z)
-    half_angle = yaw_offset / 2.0
+def apply_yaw_offset_to_quaternion(
+    qx: float,
+    qy: float,
+    qz: float,
+    qw: float,
+    yaw_offset_rad: float,
+) -> Tuple[float, float, float, float]:
+    half_angle = 0.5 * yaw_offset_rad
     offset_qw = math.cos(half_angle)
     offset_qz = math.sin(half_angle)
-    
-    # Quaternion multiplication: q_result = q_offset * q_original
-    # This rotates the original orientation by the offset
-    new_qw = offset_qw * qw - offset_qz * qz
-    new_qx = offset_qw * qx + offset_qz * qy
-    new_qy = offset_qw * qy - offset_qz * qx
-    new_qz = offset_qw * qz + offset_qz * qw
-    
-    return new_qx, new_qy, new_qz, new_qw
+    return (
+        offset_qw * qx + offset_qz * qy,
+        offset_qw * qy - offset_qz * qx,
+        offset_qw * qz + offset_qz * qw,
+        offset_qw * qw - offset_qz * qz,
+    )
 
 
-def yaw_to_quaternion(yaw):
-    """
-    Create a quaternion representing only yaw rotation (around Z axis).
-    Roll and pitch are zero.
-    yaw: heading in radians
-    Returns: (qx, qy, qz, qw)
-    """
-    half_yaw = yaw / 2.0
-    qx = 0.0
-    qy = 0.0
-    qz = math.sin(half_yaw)
-    qw = math.cos(half_yaw)
-    return qx, qy, qz, qw
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def normalize_quaternion(q: Sequence[float]) -> np.ndarray:
+    q_arr = np.asarray(q, dtype=np.float64)
+    norm = float(np.linalg.norm(q_arr))
+    if norm <= 0.0:
+        return np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return q_arr / norm
 
 
-class CrazyflieController:
-    def __init__(self, uri, use_mocap=True, trajectory_file='', trajectory_offset=None):
-        self.uri = uri
-        self.scf = None
-        self.is_flying = False
-        self.target_height = 0.0
-        self.state = 'IDLE'  # IDLE, TAKING_OFF, FLYING, LANDING, PLAYING_TRAJECTORY
-        self.use_mocap = use_mocap
-        self.trajectory_file = trajectory_file or 'trajectory.csv'
-        self.trajectory_offset = trajectory_offset or [0.0, 0.0, 0.0, 0.0]  # [x, y, z, yaw_deg]
-        
-        # Target position for mocap mode
-        self.target_x = 0.0
-        self.target_y = 0.0
-        self.target_z = 0.0
-        self.target_yaw = 0.0
-        
-        # Current mocap pose (updated from external source)
-        self.current_yaw = 0.0  # Current yaw from mocap in radians
+def quat_mul(a: Sequence[float], b: Sequence[float]) -> np.ndarray:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.asarray(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        dtype=np.float64,
+    )
 
-        # Dynamic constraints from ROS node
-        self.dynamic_xy_min_mm = 0
-        self.dynamic_xy_max_mm = 0
-        self.sending_constraints = False
-        self.last_constraint_send_time = 0
-        self.constraint_rate = 0.10  # 10Hz
-        self.manual_constraints = False
-        self.manual_constraint_step_mm = 50
 
-        # Command constants
-        self.CMD_MAGIC = 0xC0000000
-        self.CMD_START_TRAJ = 1
-        self.CMD_RESET_TRAJ = 2
-        self.CMD_SET_CONSTRAINTS = 3
+def rodrigues_attitude_error(
+    q_state_xyzw: Sequence[float],
+    desired_yaw_rad: float,
+) -> np.ndarray:
+    """Compute q_desired_yaw_conj * q_state as Rodrigues parameters."""
 
-        # Trajectory playback: waypoints (relative), origin, start time, next index, mocap log file
-        self.trajectory_waypoints = []
-        self.trajectory_origin = None  # (x, y, z, yaw_deg) in world frame when trajectory started
-        self.trajectory_start_time = 0.0
-        self.trajectory_next_index = 0  # next CSV line to apply when its time is reached
-        self.mocap_log_file = None
-        self.shutdown_requested = threading.Event()
-        self._terminal_fd = None
-        self._terminal_settings = None
-        atexit.register(self.restore_terminal)
-        
-        # Timing control
-        self.last_extpos_time = 0
-        self.last_setpoint_time = 0
-        self.extpos_rate = 0.01  # 100Hz
-        self.setpoint_rate = 0.04  # 25Hz
-        
-        # Logging
-        self.log_data = {
-            'stateEstimate.x': 0,
-            'stateEstimate.y': 0,
-            'stateEstimate.z': 0,
-            'stabilizer.roll': 0,
-            'stabilizer.pitch': 0,
-            'stabilizer.yaw': 0,
-            'range.zrange': 0,
-        }
-        
-    def _param_callback(self, name, value):
-        logger.info(f'Parameter {name} set to {value}')
-    
-    def load_trajectory(self, filepath):
-        """
-        Load trajectory from CSV: time_ms, x, y, z, yaw (time in ms from 0).
-        x, y, z are in meters and yaw in degrees; all are RELATIVE (offsets from start).
-        Returns list of (time_ms, dx, dy, dz, dyaw_deg) or empty list on error.
-        """
-        waypoints = []
-        path = os.path.expanduser(filepath)
-        if not os.path.isfile(path):
-            logger.error(f"Trajectory file not found: {path}")
-            return waypoints
+    q_state = normalize_quaternion(q_state_xyzw)
+    q_desired_yaw_conj = np.asarray(
+        [
+            0.0,
+            0.0,
+            -math.sin(0.5 * desired_yaw_rad),
+            math.cos(0.5 * desired_yaw_rad),
+        ],
+        dtype=np.float64,
+    )
+    q_error = normalize_quaternion(quat_mul(q_desired_yaw_conj, q_state))
+    if abs(float(q_error[3])) < 1.0e-6:
+        return np.zeros(3, dtype=np.float64)
+    return q_error[:3] / q_error[3]
+
+
+def default_admm_nxcore_path() -> str:
+    this_file = Path(__file__).resolve()
+    repo_root = this_file.parents[5]
+    return str(repo_root / "admm_nxcore")
+
+
+def finite_or_none(values: Optional[Sequence[float]]) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float64)
+    if np.all(np.isfinite(arr)):
+        return arr
+    return None
+
+
+@dataclass
+class FirmwareState:
+    position_m: np.ndarray
+    velocity_mps: np.ndarray
+    quaternion_xyzw: np.ndarray
+    gyro_rad_s: np.ndarray
+    yaw_rad: float
+    received_s: float
+    raw: Dict[str, float]
+
+
+@dataclass
+class MocapSample:
+    position_m: np.ndarray
+    quaternion_xyzw: np.ndarray
+    mode: str
+    received_s: float
+
+
+@dataclass
+class ReferencePoint:
+    position_m: np.ndarray
+    velocity_mps: np.ndarray
+    yaw_rad: float
+    t_s: float
+
+
+@dataclass
+class LoihiRequest:
+    epoch: int
+    state_error: np.ndarray
+    bounds_error_xy: np.ndarray
+    reference_now: ReferencePoint
+    reference_next: ReferencePoint
+    sent_s: float
+
+
+@dataclass
+class LoihiResult:
+    output_epoch: int
+    u0: np.ndarray
+    selected_error_position_m: np.ndarray
+    latency_s: float
+    raw_output: Optional[np.ndarray] = None
+
+
+@dataclass
+class Command:
+    position_m: np.ndarray
+    yaw_rad: float
+
+
+@dataclass
+class BridgeConfig:
+    uri: str
+    use_mocap: bool
+    mocap_mode: str
+    axis_mapping: List[int]
+    axis_sign: List[float]
+    yaw_offset_rad: float
+    control_period_s: float
+    extpos_period_s: float
+    state_log_period_ms: int
+    max_state_age_s: float
+    max_mocap_age_s: float
+    position_commands_enabled: bool
+    auto_takeoff: bool
+    auto_start_demo: bool
+    arm_on_connect: bool
+    takeoff_height_m: float
+    takeoff_rate_mps: float
+    land_rate_mps: float
+    z_min_m: float
+    z_max_m: float
+    max_command_step_m: float
+    fault_land_count: int
+    fixed_yaw_deg: float
+    reference_yaw_mode: str
+    circle_radius_m: float
+    circle_omega_rad_s: float
+    circle_center_m: np.ndarray
+    box_l0_m: float
+    box_delta_m: float
+    box_omega_rad_s: float
+    box_min_half_extent_m: float
+    manual_step_m: float
+    loihi_backend: str
+    mock_error_gain: float
+    loihi_admm_iterations: int
+    loihi_parallel_components: int
+    loihi_parallel_quant_bins: int
+    loihi_vector_max_abs_int: int
+    loihi_max_control_ticks: int
+    loihi_match_timeout_s: float
+    max_loihi_latency_s: float
+    loihi_ethernet_output_buffer_steps: int
+    admm_nxcore_path: str
+    log_file: str
+    print_every: int
+
+
+class StateEstimateZLogAdapter:
+    def __init__(self, period_ms: int):
+        self.period_ms = int(period_ms)
+        self._lock = threading.Lock()
+        self._latest: Optional[FirmwareState] = None
+        self._log_conf: Optional[LogConfig] = None
+
+    def start(self, cf) -> None:
+        log_conf = LogConfig(name="StateEstimateZ", period_in_ms=self.period_ms)
+        for name in (
+            "stateEstimateZ.x",
+            "stateEstimateZ.y",
+            "stateEstimateZ.z",
+            "stateEstimateZ.vx",
+            "stateEstimateZ.vy",
+            "stateEstimateZ.vz",
+            "stateEstimateZ.rateRoll",
+            "stateEstimateZ.ratePitch",
+            "stateEstimateZ.rateYaw",
+        ):
+            log_conf.add_variable(name, "int16_t")
+        log_conf.add_variable("stateEstimateZ.quat", "uint32_t")
+
+        cf.log.add_config(log_conf)
+        log_conf.data_received_cb.add_callback(self._log_callback)
+        log_conf.start()
+        self._log_conf = log_conf
+        LOGGER.info("Started stateEstimateZ firmware log at %d ms", self.period_ms)
+
+    def latest(self) -> Optional[FirmwareState]:
+        with self._lock:
+            return self._latest
+
+    def latest_age_s(self, now_s: float) -> Optional[float]:
+        sample = self.latest()
+        if sample is None:
+            return None
+        return now_s - sample.received_s
+
+    def _log_callback(self, timestamp, data, logconf) -> None:
         try:
-            with open(path, newline='') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if not row or row[0].strip().startswith('#'):
-                        continue
-                    if len(row) < 5:
-                        continue
-                    try:
-                        t_ms = float(row[0].strip())
-                        x = float(row[1].strip())
-                        y = float(row[2].strip())
-                        z = float(row[3].strip())
-                        yaw = float(row[4].strip())
-                        waypoints.append((t_ms, x, y, z, yaw))
-                    except (ValueError, IndexError):
-                        continue
-            waypoints.sort(key=lambda w: w[0])
-            logger.info(f"Loaded {len(waypoints)} waypoints from {path}")
-        except Exception as e:
-            logger.error(f"Failed to load trajectory: {e}")
-        return waypoints
-    
-    def setup_logging(self, cf):
-        """Setup logging configuration for state estimation"""
-        log_conf = LogConfig(name='StateEstimate', period_in_ms=200)
-        
-        # Add variables to log
-        log_conf.add_variable('stateEstimate.x', 'float')
-        log_conf.add_variable('stateEstimate.y', 'float')
-        log_conf.add_variable('stateEstimate.z', 'float')
-        log_conf.add_variable('stabilizer.roll', 'float')
-        log_conf.add_variable('stabilizer.pitch', 'float')
-        log_conf.add_variable('stabilizer.yaw', 'float')
-        log_conf.add_variable('range.zrange', 'uint16_t')  # Flow deck height
-        
-        try:
-            cf.log.add_config(log_conf)
-            log_conf.data_received_cb.add_callback(self._log_callback)
-            log_conf.start()
-            logger.info("Logging started")
-        except KeyError as e:
-            logger.error(f'Could not start log configuration: {e}')
-        except AttributeError as e:
-            logger.error(f'Could not add log config: {e}')
-    
-        
-    def _console_callback(self, text):
-        """Callback for console output from Crazyflie"""
-        msg = f"[CF_CONSOLE] {text}"
-        print(msg)
+            quat = normalize_quaternion(decompress_quaternion(int(data["stateEstimateZ.quat"])))
+            position_m = np.asarray(
+                [
+                    float(data["stateEstimateZ.x"]) / 1000.0,
+                    float(data["stateEstimateZ.y"]) / 1000.0,
+                    float(data["stateEstimateZ.z"]) / 1000.0,
+                ],
+                dtype=np.float64,
+            )
+            velocity_mps = np.asarray(
+                [
+                    float(data["stateEstimateZ.vx"]) / 1000.0,
+                    float(data["stateEstimateZ.vy"]) / 1000.0,
+                    float(data["stateEstimateZ.vz"]) / 1000.0,
+                ],
+                dtype=np.float64,
+            )
+            gyro_rad_s = np.asarray(
+                [
+                    float(data["stateEstimateZ.rateRoll"]) / 1000.0,
+                    -float(data["stateEstimateZ.ratePitch"]) / 1000.0,
+                    float(data["stateEstimateZ.rateYaw"]) / 1000.0,
+                ],
+                dtype=np.float64,
+            )
+            sample = FirmwareState(
+                position_m=position_m,
+                velocity_mps=velocity_mps,
+                quaternion_xyzw=quat,
+                gyro_rad_s=gyro_rad_s,
+                yaw_rad=quaternion_to_yaw(quat[0], quat[1], quat[2], quat[3]),
+                received_s=time.monotonic(),
+                raw={key: float(value) for key, value in data.items()},
+            )
+            with self._lock:
+                self._latest = sample
+        except Exception as exc:
+            LOGGER.warning("Could not parse stateEstimateZ log sample: %r", exc)
 
-    def _enable_keyboard_input(self):
-        """Put stdin in cbreak mode and save enough state to restore it later."""
-        if not sys.stdin.isatty():
-            logger.warning("stdin is not a TTY; keyboard control disabled")
-            return
 
-        self._terminal_fd = sys.stdin.fileno()
-        self._terminal_settings = termios.tcgetattr(self._terminal_fd)
-        tty.setcbreak(self._terminal_fd)
+class MocapAdapter:
+    def __init__(
+        self,
+        axis_mapping: Sequence[int],
+        axis_sign: Sequence[float],
+        yaw_offset_rad: float,
+        mocap_mode: str,
+    ):
+        if len(axis_mapping) != 3:
+            raise ValueError("axis_mapping must contain three entries.")
+        if len(axis_sign) != 3:
+            raise ValueError("axis_sign must contain three entries.")
+        self.axis_mapping = [int(value) for value in axis_mapping]
+        self.axis_sign = [float(value) for value in axis_sign]
+        self.yaw_offset_rad = float(yaw_offset_rad)
+        self.mocap_mode = str(mocap_mode)
+        self._lock = threading.Lock()
+        self._latest: Optional[MocapSample] = None
 
-    def restore_terminal(self):
-        """Restore stdin terminal settings once, even if shutdown comes from another thread."""
-        if self._terminal_fd is None or self._terminal_settings is None:
-            return
+    def update(self, msg: PoseStamped) -> None:
+        pos_raw = [
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(msg.pose.position.z),
+        ]
+        position_m = np.asarray(
+            [
+                self.axis_sign[0] * pos_raw[self.axis_mapping[0]],
+                self.axis_sign[1] * pos_raw[self.axis_mapping[1]],
+                self.axis_sign[2] * pos_raw[self.axis_mapping[2]],
+            ],
+            dtype=np.float64,
+        )
 
-        try:
-            termios.tcsetattr(self._terminal_fd, termios.TCSANOW, self._terminal_settings)
-        except termios.error as e:
-            logger.debug(f"Could not restore terminal settings: {e}")
-        finally:
-            self._terminal_fd = None
-            self._terminal_settings = None
-
-    def request_shutdown(self):
-        """Ask the control loop to stop and immediately undo terminal input mode."""
-        self.shutdown_requested.set()
-        self.restore_terminal()
-    
-    def _send_multiplexed_command(self, cf, cmd_type, payload=0):
-        """
-        Encode a command into the position setpoint floats.
-        x_bits: [Magic(2) | CmdType(2) | Reserved(12) | PayloadMin(16)]
-        y_bits: [Magic(2) | Reserved(14) | PayloadMax(16)]
-        """
-        # Pack x_bits
-        x_bits = self.CMD_MAGIC | (cmd_type << 28)
-        if cmd_type == self.CMD_SET_CONSTRAINTS:
-            x_bits |= (payload & 0xFFFF)
-
-        # Pack y_bits
-        y_bits = self.CMD_MAGIC
-        if cmd_type == self.CMD_SET_CONSTRAINTS:
-            y_bits |= ((payload >> 16) & 0xFFFF)
-
-        # Convert bits to floats
-        x_float = struct.unpack('f', struct.pack('I', x_bits))[0]
-        y_float = struct.unpack('f', struct.pack('I', y_bits))[0]
-
-        # Send magic setpoint
-        cf.commander.send_position_setpoint(x_float, y_float, 0.0, 0.0)
-
-    def _log_callback(self, timestamp, data, logconf):
-        """Callback for logging data"""
-        self.log_data.update(data)
-        height_mm = data.get('range.zrange', 0)
-        height_m = height_mm / 1000.0
-        logger.info(f"[STATE] x={data['stateEstimate.x']:.3f} y={data['stateEstimate.y']:.3f} "
-                   f"z={data['stateEstimate.z']:.3f} height={height_m:.3f}m | "
-                   f"roll={data['stabilizer.roll']:.2f} pitch={data['stabilizer.pitch']:.2f} "
-                   f"yaw={data['stabilizer.yaw']:.2f}")
-        
-    def set_parameters(self, cf, param_dict):
-        """
-        Set parameters on the Crazyflie
-        param_dict: dictionary of parameter_name: value pairs
-        """
-        logger.info(f"Setting parameters: {param_dict}")
-        
-        for param_name, value in param_dict.items():
-            try:
-                cf.param.set_value(param_name, value)
-                logger.info(f"Set {param_name} = {value}")
-                time.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Failed to set {param_name}: {e}")
-                
-    def run_control_loop(self, scf, mocap_func=None):
-        """
-        Main control loop
-        Uses absolute position setpoints when mocap is available
-        Uses velocity/hover commands for Flow Deck only
-        """
-        cf = scf.cf
-        start_time = time.time()
-        
-        # Setup logging
-        self.setup_logging(cf)
-        cf.console.receivedChar.add_callback(self._console_callback)
-        
-        if self.use_mocap:
-            logger.info("=" * 60)
-            logger.info("MOCAP CONTROL MODE - BODY FRAME POSITIONING")
-            logger.info("=" * 60)
-            logger.info("IMPORTANT: Place drone facing world +X before starting!")
-            logger.info("")
-            logger.info("Commands:")
-            logger.info("  t = takeoff (capture position and rise to 0.5m)")
-            logger.info("  l = land")
-            logger.info("  h = hover (stop at current position)")
-            logger.info("  +/- = adjust target height")
-            logger.info("  w/s = move forward/backward (body frame, 0.1m)")
-            logger.info("  a/d = move left/right (body frame, 0.1m)")
-            logger.info("  e/r = rotate yaw left/right (15 deg)")
-            logger.info("  0 = reset yaw reference (drone must face +X)")
-            logger.info("  g = go to trajectory zero point (trajectory_offset)")
-            logger.info("  T = play trajectory from CSV (time_ms, dx, dy, dz, dyaw) using configured offset")
-            logger.info("  O = start onboard FPGA trajectory")
-            logger.info("  D = start onboard FPGA trajectory + enable dynamic constraints")
-            logger.info("  B = enable dynamic constraints only (bounds relative to current setpoint)")
-            logger.info("  8/2 = manual constraint test: move upper bound +/− 5cm")
-            logger.info("  C = stop dynamic constraints (clear and revert to defaults)")
-            logger.info("  R = reset onboard FPGA trajectory")
-            logger.info("  1 = switch to PID controller")
-            logger.info("  6 = switch to INDI controller")
-            logger.info("  q = quit and land")
-            logger.info("=" * 60)
+        if self.mocap_mode == "position_only":
+            quaternion_xyzw = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
         else:
-            logger.info("=" * 60)
-            logger.info("FLOW DECK CONTROL MODE")
-            logger.info("=" * 60)
-            logger.info("Commands:")
-            logger.info("  t = takeoff")
-            logger.info("  l = land")
-            logger.info("  h = hover (stop moving)")
-            logger.info("  +/- = adjust target height")
-            logger.info("  w/s = forward/backward")
-            logger.info("  a/d = left/right")
-            logger.info("  1 = switch to PID controller")
-            logger.info("  6 = switch to INDI controller")
-            logger.info("  q = quit and land")
-            logger.info("=" * 60)
-        
-        # Manual velocity control
-        self.vx = 0.0
-        self.vy = 0.0
-        
-        # Setup keyboard input (non-blocking)
+            q_raw = [
+                float(msg.pose.orientation.x),
+                float(msg.pose.orientation.y),
+                float(msg.pose.orientation.z),
+            ]
+            qx = self.axis_sign[0] * q_raw[self.axis_mapping[0]]
+            qy = self.axis_sign[1] * q_raw[self.axis_mapping[1]]
+            qz = self.axis_sign[2] * q_raw[self.axis_mapping[2]]
+            qw = float(msg.pose.orientation.w)
+            if self.axis_sign[0] * self.axis_sign[1] * self.axis_sign[2] < 0.0:
+                qw = -qw
+            if self.yaw_offset_rad != 0.0:
+                qx, qy, qz, qw = apply_yaw_offset_to_quaternion(
+                    qx,
+                    qy,
+                    qz,
+                    qw,
+                    self.yaw_offset_rad,
+                )
+            quaternion_xyzw = normalize_quaternion([qx, qy, qz, qw])
+
+        sample = MocapSample(
+            position_m=position_m,
+            quaternion_xyzw=quaternion_xyzw,
+            mode=self.mocap_mode,
+            received_s=time.monotonic(),
+        )
+        with self._lock:
+            self._latest = sample
+
+    def latest(self) -> Optional[MocapSample]:
+        with self._lock:
+            return self._latest
+
+    def latest_age_s(self, now_s: float) -> Optional[float]:
+        sample = self.latest()
+        if sample is None:
+            return None
+        return now_s - sample.received_s
+
+    def send_external_pose(self, cf, firmware_state: Optional[FirmwareState]) -> bool:
+        sample = self.latest()
+        if sample is None:
+            return False
+        x, y, z = sample.position_m.tolist()
+        if sample.mode == "position_only":
+            cf.extpos.send_extpos(x, y, z)
+            return True
+        if sample.mode == "position_and_yaw":
+            yaw_rad = quaternion_to_yaw(*sample.quaternion_xyzw)
+            qx, qy, qz, qw = yaw_to_quaternion(yaw_rad)
+            cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
+            return True
+        cf.extpos.send_extpose(x, y, z, *sample.quaternion_xyzw.tolist())
+        return True
+
+
+class CircleReferenceGenerator:
+    def __init__(self, config: BridgeConfig):
+        self.config = config
+
+    def reference_at(self, elapsed_s: float, yaw_hold_rad: float) -> ReferencePoint:
+        t_s = float(elapsed_s)
+        radius = float(self.config.circle_radius_m)
+        omega = float(self.config.circle_omega_rad_s)
+        phase = omega * t_s
+        center = self.config.circle_center_m
+        position = np.asarray(
+            [
+                center[0] + radius * math.cos(phase),
+                center[1] + radius * math.sin(phase),
+                center[2],
+            ],
+            dtype=np.float64,
+        )
+        velocity = np.asarray(
+            [
+                -radius * omega * math.sin(phase),
+                radius * omega * math.cos(phase),
+                0.0,
+            ],
+            dtype=np.float64,
+        )
+        yaw_mode = self.config.reference_yaw_mode
+        if yaw_mode == "current":
+            yaw_rad = yaw_hold_rad
+        elif yaw_mode == "tangent":
+            yaw_rad = math.atan2(velocity[1], velocity[0]) if radius > 0.0 else yaw_hold_rad
+        else:
+            yaw_rad = math.radians(float(self.config.fixed_yaw_deg))
+        return ReferencePoint(position_m=position, velocity_mps=velocity, yaw_rad=yaw_rad, t_s=t_s)
+
+
+class DynamicBoundsShifter:
+    def __init__(self, config: BridgeConfig):
+        self.config = config
+
+    def bounds_for(self, reference: ReferencePoint) -> np.ndarray:
+        l0 = float(self.config.box_l0_m)
+        delta = float(self.config.box_delta_m)
+        omega = float(self.config.box_omega_rad_s)
+        min_extent = float(self.config.box_min_half_extent_m)
+        lx = max(min_extent, l0 + delta * math.sin(omega * reference.t_s))
+        ly = max(min_extent, l0 + delta * math.cos(omega * reference.t_s))
+        x_ref = float(reference.position_m[0])
+        y_ref = float(reference.position_m[1])
+        return np.asarray(
+            [
+                -lx - x_ref,
+                lx - x_ref,
+                -ly - y_ref,
+                ly - y_ref,
+            ],
+            dtype=np.float64,
+        )
+
+
+class BaseLoihiBackend:
+    name = "base"
+
+    def start(self, initial_state: np.ndarray) -> None:
+        return None
+
+    def solve(self, request: LoihiRequest) -> Optional[LoihiResult]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return None
+
+
+class DisabledLoihiBackend(BaseLoihiBackend):
+    name = "disabled"
+
+    def solve(self, request: LoihiRequest) -> Optional[LoihiResult]:
+        return None
+
+
+class MockLoihiBackend(BaseLoihiBackend):
+    name = "mock"
+
+    def __init__(self, error_gain: float):
+        self.error_gain = float(error_gain)
+
+    def solve(self, request: LoihiRequest) -> Optional[LoihiResult]:
+        start_s = time.monotonic()
+        e_p1 = np.asarray(request.state_error[:3], dtype=np.float64) * self.error_gain
+        e_p1[0] = float(np.clip(e_p1[0], request.bounds_error_xy[0], request.bounds_error_xy[1]))
+        e_p1[1] = float(np.clip(e_p1[1], request.bounds_error_xy[2], request.bounds_error_xy[3]))
+        return LoihiResult(
+            output_epoch=int(request.epoch),
+            u0=np.zeros(4, dtype=np.float64),
+            selected_error_position_m=e_p1,
+            latency_s=time.monotonic() - start_s,
+            raw_output=None,
+        )
+
+
+class RealLoihiBackend(BaseLoihiBackend):
+    name = "real"
+
+    def __init__(self, config: BridgeConfig):
+        self.config = config
+        self.session = None
+        self.vector_exp: Optional[int] = None
+        self.problem_data = None
+        self.control_dim = 4
+        self._prepare_import_path()
+        self._preload_runtime_modules()
+
+    def _prepare_import_path(self) -> Path:
+        admm_path = Path(self.config.admm_nxcore_path).expanduser().resolve()
+        if not admm_path.is_dir():
+            raise RuntimeError(f"admm_nxcore path does not exist: {admm_path}")
+        if str(admm_path) not in sys.path:
+            sys.path.insert(0, str(admm_path))
+        return admm_path
+
+    def _preload_runtime_modules(self) -> None:
         try:
-            if self.shutdown_requested.is_set():
-                return
-            self._enable_keyboard_input()
-            
+            from nxcore.arch.n3b.n3board import N3Board  # noqa: F401
+            from nxkernel.groups.eth_group import EthernetOutputServer  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "NxCore/NxKernel deep runtime imports failed before starting "
+                "the Loihi backend. Run `make smoke` from the Docker host."
+            ) from exc
+
+    def start(self, initial_state: np.ndarray) -> None:
+        admm_path = self._prepare_import_path()
+        self._preload_runtime_modules()
+
+        try:
+            from admm_mpc import nx as admm_nx
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import admm_mpc.nx from "
+                f"{admm_path}; check that /intel/variables.sh eth and "
+                "/intel/venv are active before launching the bridge."
+            ) from exc
+        if not admm_nx.has_loihi_runtime():
+            raise RuntimeError(
+                "admm_mpc.nx imported but HAS_LOIHI_RUNTIME is false. "
+                "This usually means a nested NxCore/NxKernel import failed "
+                f"inside {getattr(admm_nx, '__file__', '<unknown>')}. "
+                "Run `make smoke` to expose the missing import directly."
+            )
+
+        from admm_mpc.core import choose_vector_exp, dequantize_vector, quantize_vector
+        from admm_mpc.direct import build_direct_solve_pipeline
+        from admm_mpc.pipeline import build_repeated_mpc_pipeline
+        from admm_mpc.repeated import DirectSelectedStreamingEthernetSession
+        from script.header_generator import build_default_bounds, get_solver_problem_data
+
+        self._dequantize_vector = dequantize_vector
+        self._quantize_vector = quantize_vector
+
+        problem_data = get_solver_problem_data()
+        self.problem_data = problem_data
+        self.control_dim = int(problem_data["m"])
+        values = np.concatenate(
+            [
+                problem_data["u_min"],
+                problem_data["u_max"],
+                np.asarray([-4.4, 1.0, -1.0], dtype=np.float64),
+            ]
+        )
+        max_abs_int = int(self.config.loihi_vector_max_abs_int)
+        if max_abs_int > 0:
+            vector_exp = choose_vector_exp(values, max_abs_int=max_abs_int)
+        else:
+            vector_exp = choose_vector_exp(values)
+        self.vector_exp = int(vector_exp)
+
+        n_state = int(problem_data["n"])
+        initial_state = np.asarray(initial_state, dtype=np.float64)
+        if initial_state.shape[0] != n_state:
+            raise ValueError(f"initial_state must have length {n_state}, got {initial_state.shape[0]}")
+        l, u = build_default_bounds(np.zeros(n_state, dtype=np.float64))
+        repeated_pipeline = build_repeated_mpc_pipeline(
+            problem_data,
+            l,
+            u,
+            vector_exp,
+            parallel_components=int(self.config.loihi_parallel_components),
+            parallel_quant_bins=int(self.config.loihi_parallel_quant_bins),
+        )
+        direct_pipeline = build_direct_solve_pipeline(
+            problem_data,
+            repeated_pipeline,
+            parallel_components=int(self.config.loihi_parallel_components),
+            parallel_quant_bins=int(self.config.loihi_parallel_quant_bins),
+        )
+
+        y0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
+        z0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
+        initial_state_int = quantize_vector(initial_state, vector_exp)
+        z0_int[:n_state] = initial_state_int
+        input_periods = int(self.config.loihi_admm_iterations)
+        run_periods = max(1, int(self.config.loihi_max_control_ticks) * input_periods)
+
+        LOGGER.info(
+            "Starting DirectSelectedStreamingEthernetSession: ticks=%d admm_iterations=%d vector_exp=%d",
+            int(self.config.loihi_max_control_ticks),
+            input_periods,
+            int(vector_exp),
+        )
+        self.session = DirectSelectedStreamingEthernetSession(
+            direct_pipeline,
+            run_periods=run_periods,
+            input_periods=input_periods,
+            z_initial_state=z0_int,
+            y_initial_state=y0_int,
+            current_state_initial_state=initial_state_int,
+            epoch_tagging=True,
+            fresh_epoch_gate=True,
+            dynamic_xy_bounds=True,
+            ethernet_output_buffer_steps=int(self.config.loihi_ethernet_output_buffer_steps),
+        )
+
+    def solve(self, request: LoihiRequest) -> Optional[LoihiResult]:
+        if self.session is None or self.vector_exp is None:
+            raise RuntimeError("Real Loihi backend has not been started.")
+        state_int = self._quantize_vector(request.state_error, self.vector_exp)
+        bounds_int = self._quantize_vector(request.bounds_error_xy, self.vector_exp)
+        self.session.send_current_state(
+            state_int,
+            epoch=int(request.epoch),
+            xy_bounds_int=bounds_int,
+        )
+        latest = self.session.recv_matching_output(
+            int(request.epoch),
+            timeout_s=float(self.config.loihi_match_timeout_s),
+        )
+        raw = np.asarray(latest["x"], dtype=np.int64)
+        output_epoch = int(latest["epoch"])
+        offset = 1
+        u0 = self._dequantize_vector(raw[offset : offset + self.control_dim], self.vector_exp)
+        selected_error_position = self._dequantize_vector(
+            raw[offset + self.control_dim : offset + self.control_dim + 3],
+            self.vector_exp,
+        )
+        latency_s = latest.get("state_to_output_latency_s")
+        if latency_s is None:
+            latency_s = time.monotonic() - request.sent_s
+        return LoihiResult(
+            output_epoch=output_epoch,
+            u0=np.asarray(u0, dtype=np.float64),
+            selected_error_position_m=np.asarray(selected_error_position, dtype=np.float64),
+            latency_s=float(latency_s),
+            raw_output=raw.copy(),
+        )
+
+    def close(self) -> None:
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+
+
+class PositionCommandAdapter:
+    def __init__(self, enabled: bool):
+        self.enabled = bool(enabled)
+        self.last_command: Optional[Command] = None
+
+    def send(self, cf, command: Command) -> bool:
+        self.last_command = command
+        if not self.enabled:
+            return False
+        x, y, z = command.position_m.tolist()
+        cf.commander.send_position_setpoint(x, y, z, math.degrees(command.yaw_rad))
+        return True
+
+
+class SafetySupervisor:
+    def __init__(self, config: BridgeConfig):
+        self.config = config
+        self.fault_count = 0
+        self.last_fault_reason = ""
+
+    def note_success(self) -> None:
+        self.fault_count = 0
+        self.last_fault_reason = ""
+
+    def note_fault(self, reason: str) -> None:
+        self.fault_count += 1
+        self.last_fault_reason = reason
+
+    def should_land(self) -> bool:
+        return self.fault_count >= int(self.config.fault_land_count)
+
+    def clamp_command(
+        self,
+        proposed: Command,
+        anchor_position_m: Optional[Sequence[float]],
+        last_command: Optional[Command],
+        z_min_m: Optional[float] = None,
+    ) -> Command:
+        position = np.asarray(proposed.position_m, dtype=np.float64).copy()
+        z_min = self.config.z_min_m if z_min_m is None else float(z_min_m)
+        position[2] = float(np.clip(position[2], z_min, self.config.z_max_m))
+
+        if last_command is not None:
+            anchor = np.asarray(last_command.position_m, dtype=np.float64)
+        else:
+            anchor = finite_or_none(anchor_position_m)
+
+        if anchor is not None:
+            delta = position - anchor
+            norm = float(np.linalg.norm(delta))
+            max_step = float(self.config.max_command_step_m)
+            if max_step > 0.0 and norm > max_step:
+                position = anchor + delta * (max_step / norm)
+                position[2] = float(np.clip(position[2], z_min, self.config.z_max_m))
+
+        return Command(position_m=position, yaw_rad=float(proposed.yaw_rad))
+
+
+class BridgeCsvLogger:
+    FIELDNAMES = [
+        "wall_time",
+        "monotonic_s",
+        "mode",
+        "backend",
+        "commands_enabled",
+        "command_sent",
+        "fault_count",
+        "fault_reason",
+        "state_age_s",
+        "mocap_age_s",
+        "state_x",
+        "state_y",
+        "state_z",
+        "state_vx",
+        "state_vy",
+        "state_vz",
+        "state_qx",
+        "state_qy",
+        "state_qz",
+        "state_qw",
+        "state_omega_x",
+        "state_omega_y",
+        "state_omega_z",
+        "ref_t_s",
+        "ref_x",
+        "ref_y",
+        "ref_z",
+        "ref_vx",
+        "ref_vy",
+        "ref_vz",
+        "ref_yaw_deg",
+        "ref_next_x",
+        "ref_next_y",
+        "ref_next_z",
+        "e0_x",
+        "e0_y",
+        "e0_z",
+        "e0_phi_x",
+        "e0_phi_y",
+        "e0_phi_z",
+        "e0_vx",
+        "e0_vy",
+        "e0_vz",
+        "e0_omega_x",
+        "e0_omega_y",
+        "e0_omega_z",
+        "bound_ex_min",
+        "bound_ex_max",
+        "bound_ey_min",
+        "bound_ey_max",
+        "request_epoch",
+        "output_epoch",
+        "loihi_latency_s",
+        "u0_0",
+        "u0_1",
+        "u0_2",
+        "u0_3",
+        "selected_ep1_x",
+        "selected_ep1_y",
+        "selected_ep1_z",
+        "cmd_x",
+        "cmd_y",
+        "cmd_z",
+        "cmd_yaw_deg",
+    ]
+
+    def __init__(self, path: str):
+        if path:
+            resolved = Path(path).expanduser()
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            resolved = Path(f"loihi_bridge_log_{ts}.csv")
+        self.path = resolved
+        self.file = self.path.open("w", newline="")
+        self.writer = csv.DictWriter(self.file, fieldnames=self.FIELDNAMES)
+        self.writer.writeheader()
+        self.file.flush()
+        LOGGER.info("Writing Loihi bridge CSV log to %s", self.path)
+
+    def write(self, row: Dict[str, object]) -> None:
+        out = {name: row.get(name, "") for name in self.FIELDNAMES}
+        self.writer.writerow(out)
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+
+class TerminalInput:
+    def __init__(self):
+        self.fd = None
+        self.settings = None
+        atexit.register(self.restore)
+
+    def enable(self) -> None:
+        if not sys.stdin.isatty():
+            LOGGER.info("stdin is not a TTY; keyboard control disabled")
+            return
+        self.fd = sys.stdin.fileno()
+        self.settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+
+    def read_key(self) -> Optional[str]:
+        if self.fd is None:
+            return None
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+    def restore(self) -> None:
+        if self.fd is None or self.settings is None:
+            return
+        try:
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.settings)
+        except termios.error:
+            pass
+        finally:
+            self.fd = None
+            self.settings = None
+
+
+class CrazyflieLoihiBridge:
+    MODE_IDLE = "IDLE"
+    MODE_TAKEOFF = "TAKEOFF"
+    MODE_HOLD = "HOLD"
+    MODE_DEMO = "LOIHI_DEMO"
+    MODE_MANUAL = "LOIHI_MANUAL"
+    MODE_LANDING = "LANDING"
+
+    def __init__(self, config: BridgeConfig, mocap: MocapAdapter):
+        self.config = config
+        self.mocap = mocap
+        self.shutdown_requested = threading.Event()
+        self.state_adapter = StateEstimateZLogAdapter(config.state_log_period_ms)
+        self.reference_generator = CircleReferenceGenerator(config)
+        self.bounds_shifter = DynamicBoundsShifter(config)
+        self.backend = self._make_backend(config)
+        self.command_adapter = PositionCommandAdapter(config.position_commands_enabled)
+        self.safety = SafetySupervisor(config)
+        self.terminal = TerminalInput()
+        self.csv_logger: Optional[BridgeCsvLogger] = None
+
+        self.mode = self.MODE_IDLE
+        self.hold_command: Optional[Command] = None
+        self.demo_start_s: Optional[float] = None
+        self.demo_yaw_hold_rad = math.radians(config.fixed_yaw_deg)
+        self.manual_reference_position: Optional[np.ndarray] = None
+        self.epoch = 0
+        self.last_extpos_s = 0.0
+        self.last_control_s = 0.0
+        self.tick_count = 0
+        self.quit_after_landing = False
+
+    def _make_backend(self, config: BridgeConfig) -> BaseLoihiBackend:
+        backend = config.loihi_backend.lower()
+        if backend == "disabled":
+            return DisabledLoihiBackend()
+        if backend == "mock":
+            return MockLoihiBackend(config.mock_error_gain)
+        if backend == "real":
+            return RealLoihiBackend(config)
+        raise ValueError("loihi_backend must be one of: disabled, mock, real")
+
+    def request_shutdown(self) -> None:
+        self.shutdown_requested.set()
+        self.terminal.restore()
+
+    def configure_crazyflie(self, cf) -> None:
+        self.state_adapter.start(cf)
+        cf.console.receivedChar.add_callback(lambda text: print(f"[CF_CONSOLE] {text}"))
+
+        params = {
+            "stabilizer.controller": 1,
+            "stabilizer.estimator": 2,
+            "kalman.resetEstimation": 1,
+        }
+        for name, value in params.items():
+            LOGGER.info("Setting %s = %s", name, value)
+            cf.param.set_value(name, value)
+            time.sleep(0.1)
+        cf.param.set_value("kalman.resetEstimation", 0)
+        time.sleep(0.5)
+
+        self.backend.start(np.zeros(12, dtype=np.float64))
+
+        if self.config.arm_on_connect:
+            cf.platform.send_arming_request(True)
+            LOGGER.info("Sent Crazyflie arming request")
+
+    def run(self, scf: SyncCrazyflie) -> None:
+        cf = scf.cf
+        self.csv_logger = BridgeCsvLogger(self.config.log_file)
+        self.configure_crazyflie(cf)
+        self.terminal.enable()
+        self._print_controls()
+
+        if self.config.auto_takeoff:
+            self._start_takeoff()
+
+        try:
             while not self.shutdown_requested.is_set():
-                current_time = time.time()
-                
-                # Check for keyboard input (non-blocking)
-                if self._terminal_fd is not None and select.select([sys.stdin], [], [], 0)[0]:
-                    key = sys.stdin.read(1)
-                    self._handle_keyboard(key, cf)
-                    
-                    if key == 'q':
-                        logger.info("Quit command received - landing...")
-                        self.state = 'LANDING'
-                        self.target_height = 0.0
-                        time.sleep(2)  # Give time to land
-                        break
-                
-                # Send external pose/position if using mocap
-                if self.use_mocap and mocap_func is not None:
-                    if current_time - self.last_extpos_time >= self.extpos_rate:
-                        try:
-                            # Also get box constraints if available
-                            x, y, z, qx, qy, qz, qw, mode, box_min, box_max = mocap_func()
+                now_s = time.monotonic()
+                key = self.terminal.read_key()
+                if key is not None:
+                    self._handle_key(key)
 
-                            # Update constraints in controller
-                            if box_min is not None and box_max is not None and not self.manual_constraints:
-                                self.dynamic_xy_min_mm = int(box_min * 1000.0)
-                                self.dynamic_xy_max_mm = int(box_max * 1000.0)
+                if self.config.use_mocap and now_s - self.last_extpos_s >= self.config.extpos_period_s:
+                    self._send_extpos(cf)
+                    self.last_extpos_s = now_s
 
-                            if x > -25.0:  # Check for valid mocap data
-                                # Log mocap to CSV while playing trajectory
-                                if self.state == 'PLAYING_TRAJECTORY' and self.mocap_log_file is not None and self.trajectory_origin is not None:
-                                    elapsed_ms = (current_time - self.trajectory_start_time) * 1000.0
-                                    ox, oy, oz, oyaw = self.trajectory_origin
-                                    yaw_rad = quaternion_to_yaw(qx, qy, qz, qw)
-                                    yaw_deg = math.degrees(yaw_rad)
-                                    rel_yaw = yaw_deg - oyaw
-                                    if rel_yaw > 180:
-                                        rel_yaw -= 360
-                                    elif rel_yaw < -180:
-                                        rel_yaw += 360
-                                    sp_rel_yaw = self.target_yaw - oyaw
-                                    if sp_rel_yaw > 180:
-                                        sp_rel_yaw -= 360
-                                    elif sp_rel_yaw < -180:
-                                        sp_rel_yaw += 360
-                                    self.mocap_log_file.write(
-                                        f"{elapsed_ms:.2f},{x - ox:.6f},{y - oy:.6f},{z - oz:.6f},{rel_yaw:.4f},"
-                                        f"{self.target_x - ox:.6f},{self.target_y - oy:.6f},{self.target_z - oz:.6f},"
-                                        f"{sp_rel_yaw:.4f}\n"
-                                    )
-                                    self.mocap_log_file.flush()
-                                if mode == 'position_only':
-                                    # SINGLE MARKER MODE
-                                    # Only send position - IMU handles all orientation
-                                    # Get yaw from Crazyflie's IMU estimate, not mocap
-                                    cf.extpos.send_extpos(x, y, z)
-                                    self.current_yaw = math.radians(
-                                        self.log_data.get('stabilizer.yaw', 0)
-                                    )
-                                elif mode == 'position_and_yaw':
-                                    # Send position + yaw-only quaternion
-                                    # Best compromise: precise position, yaw correction,
-                                    # but IMU handles roll/pitch (smoother)
-                                    self.current_yaw = quaternion_to_yaw(qx, qy, qz, qw)
-                                    qx_yaw, qy_yaw, qz_yaw, qw_yaw = yaw_to_quaternion(self.current_yaw)
-                                    cf.extpos.send_extpose(x, y, z, qx_yaw, qy_yaw, qz_yaw, qw_yaw)
-                                else:  # 'full_pose'
-                                    # Send full 6DoF pose from mocap
-                                    self.current_yaw = quaternion_to_yaw(qx, qy, qz, qw)
-                                    cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
-                                    
-                            self.last_extpos_time = current_time
-                        except Exception as e:
-                            logger.error(f"Error sending extpose: {e}")
-                
-                # Handle periodic constraint sending
-                if self.sending_constraints and (current_time - self.last_constraint_send_time >= self.constraint_rate):
-                    payload = (self.dynamic_xy_min_mm & 0xFFFF) | ((self.dynamic_xy_max_mm & 0xFFFF) << 16)
-                    self._send_multiplexed_command(cf, self.CMD_SET_CONSTRAINTS, payload)
-                    self.last_constraint_send_time = current_time
+                if now_s - self.last_control_s >= self.config.control_period_s:
+                    dt_s = (
+                        self.config.control_period_s
+                        if self.last_control_s <= 0.0
+                        else now_s - self.last_control_s
+                    )
+                    self.last_control_s = now_s
+                    self._control_tick(cf, now_s, dt_s)
 
-                # Send setpoint at 50Hz based on state and mode
-                if current_time - self.last_setpoint_time >= self.setpoint_rate:
-                    try:
-                        if self.use_mocap:
-                            # MOCAP MODE - Use absolute position setpoints
-                            if self.state == 'PLAYING_TRAJECTORY':
-                                elapsed_ms = (current_time - self.trajectory_start_time) * 1000.0
-                                ox, oy, oz, oyaw = self.trajectory_origin or (0, 0, 0, 0)
-                                # Apply at most one waypoint per setpoint tick when its time is reached
-                                # (so point 1 at 10s is applied after many 50Hz loops of mocap/setpoint, not in one batch)
-                                if self.trajectory_next_index < len(self.trajectory_waypoints):
-                                    t_ms, dx, dy, dz, dyaw_deg = self.trajectory_waypoints[self.trajectory_next_index]
-                                    if elapsed_ms >= t_ms:
-                                        self.target_x = ox + dx
-                                        self.target_y = oy + dy
-                                        self.target_z = oz + dz
-                                        self.target_yaw = oyaw + dyaw_deg
-                                        if self.target_yaw > 180:
-                                            self.target_yaw -= 360
-                                        elif self.target_yaw < -180:
-                                            self.target_yaw += 360
-                                        self.trajectory_next_index += 1
-                                if self.trajectory_next_index >= len(self.trajectory_waypoints):
-                                    self.state = 'FLYING'
-                                    self.trajectory_origin = None
-                                    self.trajectory_next_index = 0
-                                    if self.mocap_log_file is not None:
-                                        self.mocap_log_file.close()
-                                        self.mocap_log_file = None
-                                    logger.info("✓ Trajectory playback finished")
-                            
-                            if self.state == 'TAKING_OFF':
-                                # Gradual takeoff to target height
-                                if self.target_z < 0.5:
-                                    self.target_z += 0.02
-                                else:
-                                    self.state = 'FLYING'
-                                    logger.info(f"✓ Takeoff complete at ({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f})")
-                            
-                            elif self.state == 'LANDING':
-                                # Gradual landing
-                                if self.target_z > 0.05:
-                                    self.target_z -= 0.02
-                                else:
-                                    self.target_z = 0.0
-                                    self.state = 'IDLE'
-                                    logger.info("✓ Landing complete, now IDLE")
-                            
-                            # Constraint packets are multiplexed through the same
-                            # commander setpoint queue. While they are streaming,
-                            # do not overwrite them with normal position setpoints.
-                            if self.state in ['TAKING_OFF', 'FLYING', 'LANDING', 'PLAYING_TRAJECTORY']:
-                                if not self.sending_constraints:
-                                    cf.commander.send_position_setpoint(
-                                        self.target_x,
-                                        self.target_y,
-                                        self.target_z,
-                                        self.target_yaw
-                                    )
-                            else:
-                                cf.commander.send_stop_setpoint()
-                        
-                        else:
-                            # FLOW DECK MODE - Use hover commands
-                            if self.state == 'TAKING_OFF':
-                                # Gradual takeoff - increase height
-                                if self.target_height < 0.4:
-                                    self.target_height += 0.02
-                                else:
-                                    self.state = 'FLYING'
-                                    logger.info(f"✓ Takeoff complete, now FLYING at {self.target_height:.2f}m")
-                            
-                            elif self.state == 'LANDING':
-                                # Gradual landing
-                                if self.target_height > 0.05:
-                                    self.target_height -= 0.02
-                                else:
-                                    self.target_height = 0.0
-                                    self.state = 'IDLE'
-                                    logger.info("✓ Landing complete, now IDLE")
-                            
-                            # Send appropriate command based on state
-                            if self.state in ['TAKING_OFF', 'FLYING', 'LANDING']:
-                                # Use hover mode for Flow Deck
-                                cf.commander.send_hover_setpoint(
-                                    self.vx,  # velocity x (m/s)
-                                    self.vy,  # velocity y (m/s) 
-                                    0.0,      # yaw rate (deg/s)
-                                    self.target_height  # height above ground (m)
-                                )
-                            else:
-                                # Send stop when idle
-                                cf.commander.send_stop_setpoint()
-                            
-                        self.last_setpoint_time = current_time
-                    except Exception as e:
-                        logger.error(f"Error sending setpoint: {e}")
-                
-                # Small sleep to prevent busy waiting
                 time.sleep(0.001)
-                
         except KeyboardInterrupt:
-            logger.info("Control loop interrupted")
+            LOGGER.info("Control loop interrupted")
         finally:
             self.shutdown_requested.set()
-            if self.mocap_log_file is not None:
-                try:
-                    self.mocap_log_file.close()
-                except OSError:
-                    pass
-                self.mocap_log_file = None
-            # Restore terminal settings
-            self.restore_terminal()
-            # Send stop command
+            self.terminal.restore()
             try:
                 cf.commander.send_stop_setpoint()
-            except Exception as e:
-                logger.debug(f"Could not send stop setpoint during shutdown: {e}")
-            self.is_flying = False
-            logger.info("Control loop stopped")
+            except Exception:
+                pass
+            try:
+                self.backend.close()
+            except Exception as exc:
+                LOGGER.warning("Loihi backend close failed: %r", exc)
+            if self.csv_logger is not None:
+                self.csv_logger.close()
+                self.csv_logger = None
+            LOGGER.info("Crazyflie Loihi bridge stopped")
 
-    def _enable_manual_constraints(self):
-        """Use keyboard-controlled world-frame bounds instead of OptiTrack boxes."""
-        if self.manual_constraints:
-            return
-
-        self.manual_constraints = True
-        self.sending_constraints = True
-        self.last_constraint_send_time = 0
-
-        if self.dynamic_xy_min_mm == 0 and self.dynamic_xy_max_mm == 0:
-            center_mm = int(self.target_x * 1000.0)
-            self.dynamic_xy_min_mm = center_mm - 500
-            self.dynamic_xy_max_mm = center_mm + 500
-
-        logger.info(
-            "Manual constraints enabled: "
-            f"lower fixed={self.dynamic_xy_min_mm / 1000.0:.3f}m, "
-            f"upper={self.dynamic_xy_max_mm / 1000.0:.3f}m"
+    def _print_controls(self) -> None:
+        LOGGER.info(
+            "Controls: t=takeoff, n=manual Loihi, wasd=manual x/y, +/-=manual z, "
+            "m=start Loihi trajectory, h=hold, l=land, q=land and quit"
         )
-    
-    def _handle_keyboard(self, key, cf):
-        """Handle keyboard commands"""
-        if key == 't':
-            if self.state == 'IDLE':
-                if self.use_mocap:
-                    # Capture current position and yaw from state estimate
-                    self.target_x = self.log_data.get('stateEstimate.x', 0)
-                    self.target_y = self.log_data.get('stateEstimate.y', 0)
-                    self.target_z = 0.0  # Start from ground
-                    # Capture current yaw and use it as target (maintain heading)
-                    self.target_yaw = math.degrees(self.current_yaw)
-                    logger.info(f"⬆ TAKEOFF - position ({self.target_x:.2f}, {self.target_y:.2f}), yaw={self.target_yaw:.1f}°, rising to 0.5m")
-                else:
-                    logger.info("⬆ TAKEOFF command - starting takeoff")
-                
-                self.state = 'TAKING_OFF'
-                self.target_height = 0.0
-            else:
-                logger.warning(f"⚠ Can only takeoff from IDLE state (current: {self.state})")
-        
-        elif key == 'l':
-            if self.state in ['FLYING', 'TAKING_OFF']:
-                logger.info("⬇ LAND command - starting landing")
-                self.state = 'LANDING'
-            else:
-                logger.warning(f"⚠ Can only land from FLYING/TAKING_OFF state (current: {self.state})")
-        
-        elif key == 'h':
-            if self.state == 'FLYING':
-                if self.use_mocap:
-                    # Capture current position and yaw, hold it
-                    self.target_x = self.log_data.get('stateEstimate.x', self.target_x)
-                    self.target_y = self.log_data.get('stateEstimate.y', self.target_y)
-                    self.target_z = self.log_data.get('stateEstimate.z', self.target_z)
-                    self.target_yaw = math.degrees(self.current_yaw)
-                    logger.info(f"⏸ HOVER - locked at ({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f}) yaw={self.target_yaw:.1f}°")
-                else:
-                    # Stop all velocity
-                    self.vx = 0.0
-                    self.vy = 0.0
-                    logger.info(f"⏸ HOVER command - stopped at {self.target_height:.2f}m")
-            else:
-                logger.warning("⚠ Can only hover while FLYING")
-        
-        elif key == '+' or key == '=':
-            if self.state == 'FLYING':
-                if self.use_mocap:
-                    self.target_z = min(self.target_z + DELTA, 2.0)
-                    logger.info(f"⬆ Increasing height to {self.target_z:.2f}m")
-                else:
-                    self.target_height = min(self.target_height + DELTA, 1.5)
-                    logger.info(f"⬆ Increasing height to {self.target_height:.2f}m")
-        
-        elif key == '-' or key == '_':
-            if self.state == 'FLYING':
-                if self.use_mocap:
-                    self.target_z = max(self.target_z - DELTA, 0.2)
-                    logger.info(f"⬇ Decreasing height to {self.target_z:.2f}m")
-                else:
-                    self.target_height = max(self.target_height - DELTA, 0.2)
-                    logger.info(f"⬇ Decreasing height to {self.target_height:.2f}m")
-        
-        # Yaw control
-        elif key == 'e':
-            if self.state == 'FLYING' and self.use_mocap:
-                self.target_yaw += 15.0  # Rotate left (counter-clockwise)
-                # Normalize to -180 to 180
-                if self.target_yaw > 180:
-                    self.target_yaw -= 360
-                logger.info(f"↺ Yaw left to {self.target_yaw:.1f}°")
-        
-        elif key == 'r':
-            if self.state == 'FLYING' and self.use_mocap:
-                self.target_yaw -= 15.0  # Rotate right (clockwise)
-                # Normalize to -180 to 180
-                if self.target_yaw < -180:
-                    self.target_yaw += 360
-                logger.info(f"↻ Yaw right to {self.target_yaw:.1f}°")
-        
-        # Controller switching
-        elif key == '1':
+        LOGGER.info("Loihi backend: %s; position commands enabled: %s", self.backend.name, self.command_adapter.enabled)
+
+    def _handle_key(self, key: str) -> None:
+        if key == "t":
+            self._start_takeoff()
+        elif key == "n":
+            self._start_manual_loihi()
+        elif key == "m":
+            self._start_demo()
+        elif key == "h":
+            self._start_hold()
+        elif key == "l":
+            self._start_landing()
+        elif key == "q":
+            self._start_landing()
+            self.quit_after_landing = True
+        elif key in ("w", "a", "s", "d", "+", "=", "-", "_"):
+            self._handle_manual_reference_key(key)
+
+    def _send_extpos(self, cf) -> None:
+        try:
+            sent = self.mocap.send_external_pose(cf, self.state_adapter.latest())
+            if not sent:
+                return
+        except Exception as exc:
+            LOGGER.warning("Error sending mocap external position: %r", exc)
+
+    def _start_takeoff(self) -> None:
+        state = self.state_adapter.latest()
+        anchor = self._current_position_or_last_command(state)
+        yaw_rad = state.yaw_rad if state is not None else math.radians(self.config.fixed_yaw_deg)
+        self.hold_command = Command(
+            position_m=np.asarray([anchor[0], anchor[1], max(0.0, anchor[2])], dtype=np.float64),
+            yaw_rad=yaw_rad,
+        )
+        self.demo_yaw_hold_rad = yaw_rad
+        self.mode = self.MODE_TAKEOFF
+        LOGGER.info("Takeoff requested from %.3f %.3f %.3f", *self.hold_command.position_m)
+
+    def _start_hold(self) -> None:
+        state = self.state_adapter.latest()
+        anchor = self._current_position_or_last_command(state)
+        yaw_rad = state.yaw_rad if state is not None else self.demo_yaw_hold_rad
+        self.hold_command = Command(position_m=np.asarray(anchor, dtype=np.float64), yaw_rad=yaw_rad)
+        self.demo_start_s = None
+        self.manual_reference_position = None
+        self.mode = self.MODE_HOLD
+        LOGGER.info("Holding %.3f %.3f %.3f", *self.hold_command.position_m)
+
+    def _start_demo(self) -> None:
+        if self.backend.name == "disabled":
+            LOGGER.warning("Cannot start Loihi demo while loihi_backend is disabled")
+            return
+        state = self.state_adapter.latest()
+        if state is not None:
+            self.demo_yaw_hold_rad = state.yaw_rad
+        self.demo_start_s = time.monotonic()
+        self.mode = self.MODE_DEMO
+        LOGGER.info("Started Loihi circular-reference box demo")
+
+    def _start_manual_loihi(self) -> None:
+        if self.backend.name == "disabled":
+            LOGGER.warning("Cannot start manual Loihi mode while loihi_backend is disabled")
+            return
+        state = self.state_adapter.latest()
+        anchor = self._current_position_or_last_command(state)
+        anchor[2] = float(np.clip(anchor[2], self.config.z_min_m, self.config.z_max_m))
+        yaw_rad = state.yaw_rad if state is not None else self.demo_yaw_hold_rad
+        self.demo_yaw_hold_rad = yaw_rad
+        self.manual_reference_position = np.asarray(anchor, dtype=np.float64)
+        self.demo_start_s = time.monotonic()
+        self.mode = self.MODE_MANUAL
+        LOGGER.info("Started manual Loihi mode at %.3f %.3f %.3f", *self.manual_reference_position)
+
+    def _handle_manual_reference_key(self, key: str) -> None:
+        if self.mode != self.MODE_MANUAL or self.manual_reference_position is None:
+            return
+        step = float(self.config.manual_step_m)
+        if key == "w":
+            self.manual_reference_position[0] += step
+        elif key == "s":
+            self.manual_reference_position[0] -= step
+        elif key == "a":
+            self.manual_reference_position[1] += step
+        elif key == "d":
+            self.manual_reference_position[1] -= step
+        elif key in ("+", "="):
+            self.manual_reference_position[2] += step
+        elif key in ("-", "_"):
+            self.manual_reference_position[2] -= step
+        self.manual_reference_position[2] = float(
+            np.clip(self.manual_reference_position[2], self.config.z_min_m, self.config.z_max_m)
+        )
+        LOGGER.info("Manual Loihi reference %.3f %.3f %.3f", *self.manual_reference_position)
+
+    def _start_landing(self) -> None:
+        if self.hold_command is None:
+            state = self.state_adapter.latest()
+            anchor = self._current_position_or_last_command(state)
+            yaw_rad = state.yaw_rad if state is not None else self.demo_yaw_hold_rad
+            self.hold_command = Command(np.asarray(anchor, dtype=np.float64), yaw_rad)
+        self.demo_start_s = None
+        self.manual_reference_position = None
+        self.mode = self.MODE_LANDING
+        LOGGER.info("Landing requested")
+
+    def _control_tick(self, cf, now_s: float, dt_s: float) -> None:
+        self.tick_count += 1
+        state = self.state_adapter.latest()
+        mocap_age = self.mocap.latest_age_s(now_s) if self.config.use_mocap else None
+        state_age = self.state_adapter.latest_age_s(now_s)
+
+        if self.config.auto_start_demo and self.mode == self.MODE_HOLD and self.backend.name != "disabled":
+            self._start_demo()
+
+        command: Optional[Command] = None
+        command_sent = False
+        row: Dict[str, object] = {
+            "wall_time": datetime.now().isoformat(timespec="milliseconds"),
+            "monotonic_s": f"{now_s:.6f}",
+            "mode": self.mode,
+            "backend": self.backend.name,
+            "commands_enabled": int(self.command_adapter.enabled),
+            "fault_count": self.safety.fault_count,
+            "fault_reason": self.safety.last_fault_reason,
+            "state_age_s": "" if state_age is None else f"{state_age:.6f}",
+            "mocap_age_s": "" if mocap_age is None else f"{mocap_age:.6f}",
+        }
+        self._fill_state_row(row, state)
+
+        active_mode = self.mode != self.MODE_IDLE
+        safety_block_reason = ""
+        if (
+            active_mode
+            and self.config.use_mocap
+            and (mocap_age is None or mocap_age > self.config.max_mocap_age_s)
+        ):
+            safety_block_reason = "mocap_stale"
+            self.safety.note_fault("mocap_stale")
+            if self.safety.should_land():
+                self._start_landing()
+        elif self.mode in (self.MODE_DEMO, self.MODE_MANUAL) and (
+            state_age is None or state_age > self.config.max_state_age_s
+        ):
+            safety_block_reason = "stateEstimateZ_stale"
+            self.safety.note_fault("stateEstimateZ_stale")
+            if self.safety.should_land():
+                self._start_landing()
+
+        if self.mode == self.MODE_IDLE:
             try:
-                cf.param.set_value('stabilizer.controller', 1)
-                logger.info("🎮 Switched to PID controller (1)")
-            except Exception as e:
-                logger.error(f"Failed to set controller: {e}")
-        
-        elif key == '6':
-            try:
-                cf.param.set_value('stabilizer.controller', 6)
-                logger.info("🎮 Switched to FPGA controller (6)")
-            except Exception as e:
-                logger.error(f"Failed to set controller: {e}")
-        
-        # Go to trajectory zero point (g): the configured trajectory offset in world frame.
-        elif key == 'g':
-            if self.state == 'FLYING' and self.use_mocap:
-                ox_off, oy_off, oz_off, oyaw_off = self.trajectory_offset
-                self.target_x = ox_off
-                self.target_y = oy_off
-                self.target_z = oz_off
-                self.target_yaw = oyaw_off
-                while self.target_yaw > 180:
-                    self.target_yaw -= 360
-                while self.target_yaw < -180:
-                    self.target_yaw += 360
-                logger.info(
-                    f"📍 Moved target to trajectory zero (offset): "
-                    f"({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f}), "
-                    f"yaw={self.target_yaw:.1f}°"
-                )
-            else:
-                logger.warning("⚠ Go to trajectory zero only when FLYING with mocap (press g)")
+                cf.commander.send_stop_setpoint()
+            except Exception:
+                pass
+        elif safety_block_reason and self.mode != self.MODE_LANDING:
+            command = self._fault_hold_command(state)
+        elif self.mode == self.MODE_TAKEOFF:
+            command = self._takeoff_command(dt_s)
+            if command.position_m[2] >= self.config.takeoff_height_m:
+                self.mode = self.MODE_HOLD
+                LOGGER.info("Takeoff complete")
+        elif self.mode == self.MODE_HOLD:
+            command = self.hold_command
+        elif self.mode == self.MODE_LANDING:
+            command = self._landing_command(dt_s)
+        elif self.mode == self.MODE_DEMO:
+            command, demo_row = self._demo_command(now_s, state)
+            row.update(demo_row)
+        elif self.mode == self.MODE_MANUAL:
+            command, manual_row = self._manual_loihi_command(now_s, state)
+            row.update(manual_row)
 
-        # Trajectory playback from CSV (T = shift+t). Each point is offset by trajectory_offset.
-        elif key == 'T':
-            if self.state == 'FLYING' and self.use_mocap:
-                self.trajectory_waypoints = self.load_trajectory(self.trajectory_file)
-                if not self.trajectory_waypoints:
-                    logger.warning("No trajectory loaded - check trajectory_file path")
-                else:
-                    self.trajectory_origin = tuple(self.trajectory_offset)
-                    self.trajectory_next_index = 0
-                    self.state = 'PLAYING_TRAJECTORY'
-                    self.trajectory_start_time = time.time()
-                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    mocap_log_path = f"mocap_log_{ts}.csv"
-                    try:
-                        self.mocap_log_file = open(mocap_log_path, 'w')
-                        self.mocap_log_file.write(
-                            "time_ms,x,y,z,yaw_deg,sp_x,sp_y,sp_z,sp_yaw_deg\n"
-                        )
-                        self.mocap_log_file.flush()
-                        logger.info(
-                            f"▶ Playing trajectory from {self.trajectory_file} "
-                            f"(offset={self.trajectory_offset}), "
-                            f"logging mocap+setpoint (relative) to {mocap_log_path}"
-                        )
-                    except OSError as e:
-                        logger.error(f"Could not open mocap log file {mocap_log_path}: {e}")
-                        self.mocap_log_file = None
-            else:
-                logger.warning("⚠ Start trajectory only when FLYING with mocap (press T)")
+        if command is not None:
+            anchor = None if state is None else state.position_m
+            command = self.safety.clamp_command(
+                command,
+                anchor_position_m=anchor,
+                last_command=self.command_adapter.last_command,
+                z_min_m=0.0 if self.mode == self.MODE_LANDING else None,
+            )
+            command_sent = self.command_adapter.send(cf, command)
+            row["cmd_x"] = f"{command.position_m[0]:.6f}"
+            row["cmd_y"] = f"{command.position_m[1]:.6f}"
+            row["cmd_z"] = f"{command.position_m[2]:.6f}"
+            row["cmd_yaw_deg"] = f"{math.degrees(command.yaw_rad):.6f}"
 
-        # Onboard Trajectory Start (O)
-        elif key == 'O':
-            if self.state == 'FLYING' and self.use_mocap:
-                logger.info("▶ Starting ONBOARD FPGA trajectory")
-                self._send_multiplexed_command(cf, self.CMD_START_TRAJ)
-            else:
-                logger.warning("⚠ Start onboard trajectory only when FLYING with mocap (press O)")
+        row["command_sent"] = int(command_sent)
+        row["fault_count"] = self.safety.fault_count
+        row["fault_reason"] = self.safety.last_fault_reason
+        if self.csv_logger is not None:
+            self.csv_logger.write(row)
 
-        # Onboard Trajectory Start + Constraints (D)
-        elif key == 'D':
-            if self.state == 'FLYING' and self.use_mocap:
-                logger.info("▶ Starting ONBOARD FPGA trajectory + DYNAMIC CONSTRAINTS")
-                self._send_multiplexed_command(cf, self.CMD_START_TRAJ)
-                self.sending_constraints = True
-            else:
-                logger.warning("⚠ Start onboard trajectory with constraints only when FLYING with mocap (press D)")
+        if self.tick_count % max(1, int(self.config.print_every)) == 0:
+            self._print_status(row)
 
-        # Dynamic Constraints Only (B)
-        elif key == 'B':
-            if self.state == 'FLYING' and self.use_mocap:
-                self.manual_constraints = False
-                logger.info("▣ Enabling DYNAMIC CONSTRAINTS without starting onboard trajectory")
-                self.sending_constraints = True
-                self.last_constraint_send_time = 0
-            else:
-                logger.warning("⚠ Enable dynamic constraints only when FLYING with mocap (press B)")
+    def _takeoff_command(self, dt_s: float) -> Command:
+        if self.hold_command is None:
+            self._start_takeoff()
+        assert self.hold_command is not None
+        next_pos = self.hold_command.position_m.copy()
+        next_pos[2] = min(
+            float(self.config.takeoff_height_m),
+            next_pos[2] + max(0.0, float(self.config.takeoff_rate_mps)) * max(0.0, dt_s),
+        )
+        self.hold_command = Command(position_m=next_pos, yaw_rad=self.hold_command.yaw_rad)
+        return self.hold_command
 
-        # Manual dynamic constraint test: keep lower bound fixed, move upper bound.
-        elif key == '8':
-            if self.state == 'FLYING' and self.use_mocap:
-                self._enable_manual_constraints()
-                self.dynamic_xy_max_mm += self.manual_constraint_step_mm
-                logger.info(
-                    "Manual constraint upper increased: "
-                    f"lower={self.dynamic_xy_min_mm / 1000.0:.3f}m, "
-                    f"upper={self.dynamic_xy_max_mm / 1000.0:.3f}m"
-                )
-            else:
-                logger.warning("⚠ Manual constraints only while FLYING with mocap")
+    def _landing_command(self, dt_s: float) -> Command:
+        if self.hold_command is None:
+            state = self.state_adapter.latest()
+            anchor = self._current_position_or_last_command(state)
+            self.hold_command = Command(np.asarray(anchor, dtype=np.float64), self.demo_yaw_hold_rad)
+        next_pos = self.hold_command.position_m.copy()
+        next_pos[2] = max(0.0, next_pos[2] - max(0.0, self.config.land_rate_mps) * max(0.0, dt_s))
+        self.hold_command = Command(position_m=next_pos, yaw_rad=self.hold_command.yaw_rad)
+        if next_pos[2] <= 0.02:
+            self.mode = self.MODE_IDLE
+            if self.quit_after_landing:
+                self.shutdown_requested.set()
+        return self.hold_command
 
-        elif key == '2':
-            if self.state == 'FLYING' and self.use_mocap:
-                self._enable_manual_constraints()
-                next_max = self.dynamic_xy_max_mm - self.manual_constraint_step_mm
-                if next_max <= self.dynamic_xy_min_mm:
-                    logger.warning("⚠ Manual constraint upper bound cannot cross lower bound")
-                else:
-                    self.dynamic_xy_max_mm = next_max
-                    logger.info(
-                        "Manual constraint upper decreased: "
-                        f"lower={self.dynamic_xy_min_mm / 1000.0:.3f}m, "
-                        f"upper={self.dynamic_xy_max_mm / 1000.0:.3f}m"
-                    )
-            else:
-                logger.warning("⚠ Manual constraints only while FLYING with mocap")
+    def _demo_command(
+        self,
+        now_s: float,
+        state: Optional[FirmwareState],
+    ) -> Tuple[Optional[Command], Dict[str, object]]:
+        if state is None:
+            self.safety.note_fault("stateEstimateZ_missing")
+            if self.safety.should_land():
+                self._start_landing()
+            return self.hold_command, {}
 
-        # Stop Constraints (C)
-        elif key == 'C':
-            logger.info("⏹ Stopping DYNAMIC CONSTRAINTS")
-            self.manual_constraints = False
-            self.sending_constraints = False
-            self._send_multiplexed_command(cf, self.CMD_SET_CONSTRAINTS, 0) # Payload 0 clears
+        if self.demo_start_s is None:
+            self.demo_start_s = now_s
+        elapsed_s = now_s - self.demo_start_s
+        reference_now = self.reference_generator.reference_at(elapsed_s, self.demo_yaw_hold_rad)
+        reference_next = self.reference_generator.reference_at(
+            elapsed_s + self.config.control_period_s,
+            self.demo_yaw_hold_rad,
+        )
+        return self._loihi_reference_command(state, reference_now, reference_next)
 
-        # Reset Onboard Trajectory (R)
-        elif key == 'R':
-            logger.info("↺ Resetting ONBOARD FPGA trajectory")
-            self._send_multiplexed_command(cf, self.CMD_RESET_TRAJ)
-        
-        # Yaw/Kalman reset - use when drone is facing +X to reset yaw reference
-        elif key == '0':
-            try:
-                cf.param.set_value('kalman.resetEstimation', 1)
-                time.sleep(0.1)
-                cf.param.set_value('kalman.resetEstimation', 0)
-                self.current_yaw = 0.0
-                logger.info("🧭 Kalman filter reset - yaw reference set to 0 (drone should face +X)")
-            except Exception as e:
-                logger.error(f"Failed to reset Kalman filter: {e}")
-        
-        # Movement control - in BODY frame (relative to drone heading)
-        elif key == 'w':
-            if self.state == 'FLYING':
-                if self.use_mocap:
-                    # Move forward in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(DELTA, 0.0, self.current_yaw)
-                    self.target_x += dx_world
-                    self.target_y += dy_world
-                    logger.info(f"↑ Forward (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
-                else:
-                    self.vx = min(self.vx + DELTA, 0.5)
-                    logger.info(f"→ Forward velocity: {self.vx:.2f} m/s")
-        
-        elif key == 's':
-            if self.state == 'FLYING':
-                if self.use_mocap:
-                    # Move backward in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(-DELTA, 0.0, self.current_yaw)
-                    self.target_x += dx_world
-                    self.target_y += dy_world
-                    logger.info(f"↓ Backward (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
-                else:
-                    self.vx = max(self.vx - DELTA, -0.5)
-                    logger.info(f"← Backward velocity: {self.vx:.2f} m/s")
-        
-        elif key == 'a':
-            if self.state == 'FLYING':
-                if self.use_mocap:
-                    # Move left in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(0.0, DELTA, self.current_yaw)
-                    self.target_x += dx_world
-                    self.target_y += dy_world
-                    logger.info(f"← Left (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
-                else:
-                    self.vy = min(self.vy + DELTA, 0.5)
-                    logger.info(f"← Left velocity: {self.vy:.2f} m/s")
-        
-        elif key == 'd':
-            if self.state == 'FLYING':
-                if self.use_mocap:
-                    # Move right in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(0.0, -DELTA, self.current_yaw)
-                    self.target_x += dx_world
-                    self.target_y += dy_world
-                    logger.info(f"→ Right (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
-                else:
-                    self.vy = max(self.vy - DELTA, -0.5)
-                    logger.info(f"→ Right velocity: {self.vy:.2f} m/s")
-        
-        elif key == 'q':
-            logger.info("⏹ Quit requested")
-        
-        else:
-            logger.debug(f"Unknown key: {key}")
+    def _manual_loihi_command(
+        self,
+        now_s: float,
+        state: Optional[FirmwareState],
+    ) -> Tuple[Optional[Command], Dict[str, object]]:
+        if state is None:
+            self.safety.note_fault("stateEstimateZ_missing")
+            if self.safety.should_land():
+                self._start_landing()
+            return self.hold_command, {}
+        if self.manual_reference_position is None:
+            self._start_manual_loihi()
+        if self.manual_reference_position is None:
+            return self.hold_command, {}
+        elapsed_s = 0.0 if self.demo_start_s is None else now_s - self.demo_start_s
+        reference = ReferencePoint(
+            position_m=self.manual_reference_position.copy(),
+            velocity_mps=np.zeros(3, dtype=np.float64),
+            yaw_rad=self.demo_yaw_hold_rad,
+            t_s=elapsed_s,
+        )
+        return self._loihi_reference_command(state, reference, reference)
+
+    def _loihi_reference_command(
+        self,
+        state: FirmwareState,
+        reference_now: ReferencePoint,
+        reference_next: ReferencePoint,
+    ) -> Tuple[Optional[Command], Dict[str, object]]:
+        row: Dict[str, object] = {}
+        bounds_error_xy = self.bounds_shifter.bounds_for(reference_now)
+        state_error = self._build_loihi_state_error(state, reference_now)
+
+        self.epoch += 1
+        request = LoihiRequest(
+            epoch=self.epoch,
+            state_error=state_error,
+            bounds_error_xy=bounds_error_xy,
+            reference_now=reference_now,
+            reference_next=reference_next,
+            sent_s=time.monotonic(),
+        )
+        row.update(self._request_row(request))
+
+        try:
+            result = self.backend.solve(request)
+        except Exception as exc:
+            self.safety.note_fault(f"loihi_error:{exc}")
+            LOGGER.warning("Loihi solve failed: %r", exc)
+            if self.safety.should_land():
+                self._start_landing()
+            return self._hold_current_position(state), row
+
+        if result is None:
+            self.safety.note_fault("loihi_missing")
+            if self.safety.should_land():
+                self._start_landing()
+            return self._hold_current_position(state), row
+
+        row.update(self._result_row(result))
+        if self.config.max_loihi_latency_s > 0.0 and result.latency_s > self.config.max_loihi_latency_s:
+            self.safety.note_fault("loihi_stale")
+            if self.safety.should_land():
+                self._start_landing()
+            return self._hold_current_position(state), row
+
+        if int(result.output_epoch) != int(request.epoch):
+            self.safety.note_fault("loihi_epoch_mismatch")
+            if self.safety.should_land():
+                self._start_landing()
+            return self._hold_current_position(state), row
+
+        p_cmd_abs = reference_next.position_m - result.selected_error_position_m
+        command = Command(position_m=p_cmd_abs, yaw_rad=reference_next.yaw_rad)
+        self.hold_command = command
+        self.safety.note_success()
+        return command, row
+
+    def _build_loihi_state_error(self, state: FirmwareState, reference: ReferencePoint) -> np.ndarray:
+        position_error = state.position_m - reference.position_m
+        phi = rodrigues_attitude_error(state.quaternion_xyzw, reference.yaw_rad)
+        return np.concatenate(
+            [
+                position_error,
+                phi,
+                state.velocity_mps,
+                state.gyro_rad_s,
+            ]
+        ).astype(np.float64)
+
+    def _hold_current_position(self, state: FirmwareState) -> Command:
+        command = Command(position_m=state.position_m.copy(), yaw_rad=state.yaw_rad)
+        self.hold_command = command
+        return command
+
+    def _fault_hold_command(self, state: Optional[FirmwareState]) -> Optional[Command]:
+        if state is not None:
+            return self._hold_current_position(state)
+        return self.hold_command
+
+    def _current_position_or_last_command(self, state: Optional[FirmwareState]) -> np.ndarray:
+        if state is not None:
+            return state.position_m.copy()
+        mocap = self.mocap.latest()
+        if mocap is not None:
+            return mocap.position_m.copy()
+        if self.command_adapter.last_command is not None:
+            return self.command_adapter.last_command.position_m.copy()
+        return np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
+
+    def _fill_state_row(self, row: Dict[str, object], state: Optional[FirmwareState]) -> None:
+        if state is None:
+            return
+        row.update(
+            {
+                "state_x": f"{state.position_m[0]:.6f}",
+                "state_y": f"{state.position_m[1]:.6f}",
+                "state_z": f"{state.position_m[2]:.6f}",
+                "state_vx": f"{state.velocity_mps[0]:.6f}",
+                "state_vy": f"{state.velocity_mps[1]:.6f}",
+                "state_vz": f"{state.velocity_mps[2]:.6f}",
+                "state_qx": f"{state.quaternion_xyzw[0]:.9f}",
+                "state_qy": f"{state.quaternion_xyzw[1]:.9f}",
+                "state_qz": f"{state.quaternion_xyzw[2]:.9f}",
+                "state_qw": f"{state.quaternion_xyzw[3]:.9f}",
+                "state_omega_x": f"{state.gyro_rad_s[0]:.6f}",
+                "state_omega_y": f"{state.gyro_rad_s[1]:.6f}",
+                "state_omega_z": f"{state.gyro_rad_s[2]:.6f}",
+            }
+        )
+
+    def _request_row(self, request: LoihiRequest) -> Dict[str, object]:
+        e0 = request.state_error
+        bounds = request.bounds_error_xy
+        ref = request.reference_now
+        ref_next = request.reference_next
+        return {
+            "ref_t_s": f"{ref.t_s:.6f}",
+            "ref_x": f"{ref.position_m[0]:.6f}",
+            "ref_y": f"{ref.position_m[1]:.6f}",
+            "ref_z": f"{ref.position_m[2]:.6f}",
+            "ref_vx": f"{ref.velocity_mps[0]:.6f}",
+            "ref_vy": f"{ref.velocity_mps[1]:.6f}",
+            "ref_vz": f"{ref.velocity_mps[2]:.6f}",
+            "ref_yaw_deg": f"{math.degrees(ref.yaw_rad):.6f}",
+            "ref_next_x": f"{ref_next.position_m[0]:.6f}",
+            "ref_next_y": f"{ref_next.position_m[1]:.6f}",
+            "ref_next_z": f"{ref_next.position_m[2]:.6f}",
+            "e0_x": f"{e0[0]:.6f}",
+            "e0_y": f"{e0[1]:.6f}",
+            "e0_z": f"{e0[2]:.6f}",
+            "e0_phi_x": f"{e0[3]:.6f}",
+            "e0_phi_y": f"{e0[4]:.6f}",
+            "e0_phi_z": f"{e0[5]:.6f}",
+            "e0_vx": f"{e0[6]:.6f}",
+            "e0_vy": f"{e0[7]:.6f}",
+            "e0_vz": f"{e0[8]:.6f}",
+            "e0_omega_x": f"{e0[9]:.6f}",
+            "e0_omega_y": f"{e0[10]:.6f}",
+            "e0_omega_z": f"{e0[11]:.6f}",
+            "bound_ex_min": f"{bounds[0]:.6f}",
+            "bound_ex_max": f"{bounds[1]:.6f}",
+            "bound_ey_min": f"{bounds[2]:.6f}",
+            "bound_ey_max": f"{bounds[3]:.6f}",
+            "request_epoch": int(request.epoch),
+        }
+
+    def _result_row(self, result: LoihiResult) -> Dict[str, object]:
+        u0 = np.zeros(4, dtype=np.float64)
+        u0[: min(4, result.u0.shape[0])] = result.u0[: min(4, result.u0.shape[0])]
+        return {
+            "output_epoch": int(result.output_epoch),
+            "loihi_latency_s": f"{result.latency_s:.6f}",
+            "u0_0": f"{u0[0]:.6f}",
+            "u0_1": f"{u0[1]:.6f}",
+            "u0_2": f"{u0[2]:.6f}",
+            "u0_3": f"{u0[3]:.6f}",
+            "selected_ep1_x": f"{result.selected_error_position_m[0]:.6f}",
+            "selected_ep1_y": f"{result.selected_error_position_m[1]:.6f}",
+            "selected_ep1_z": f"{result.selected_error_position_m[2]:.6f}",
+        }
+
+    def _print_status(self, row: Dict[str, object]) -> None:
+        LOGGER.info(
+            "mode=%s backend=%s epoch=%s/%s cmd=(%s,%s,%s) faults=%s reason=%s",
+            row.get("mode", ""),
+            row.get("backend", ""),
+            row.get("request_epoch", ""),
+            row.get("output_epoch", ""),
+            row.get("cmd_x", ""),
+            row.get("cmd_y", ""),
+            row.get("cmd_z", ""),
+            row.get("fault_count", ""),
+            row.get("fault_reason", ""),
+        )
 
 
 class CrazyflieROS2Node(Node):
     def __init__(self):
-        super().__init__('crazyflie_controller_node')
-        
-        # Declare parameters
-        self.declare_parameter('uri', URI)
-        self.declare_parameter('mocap_topic', '/optitrack/marker/pose')
-        self.declare_parameter('box1_topic', '/optitrack/box1/pose')
-        self.declare_parameter('box2_topic', '/optitrack/box2/pose')
-        self.declare_parameter('use_mocap', True)
-        
-        # Coordinate frame transformation parameters
-        # OptiTrack to Crazyflie frame mapping
-        # Motive default is often: X-right, Y-up, Z-back (right-handed)
-        # Crazyflie expects: X-forward, Y-left, Z-up (right-handed, ENU-like)
-        # 
-        # axis_mapping: which mocap axis maps to CF axis [cf_x, cf_y, cf_z]
-        #   e.g., [0, 2, 1] means: CF_x = mocap_x, CF_y = mocap_z, CF_z = mocap_y
-        # axis_sign: sign flip for each axis [sign_x, sign_y, sign_z]
-        #   e.g., [1, -1, 1] means: flip Y axis
-        self.declare_parameter('axis_mapping', [0, 1, 2])  # [x, y, z] -> [x, y, z] (no remapping)
-        self.declare_parameter('axis_sign', [1.0, 1.0, 1.0])  # no sign flip
-        
-        # Yaw offset in degrees - to correct for rigid body creation orientation
-        # If the drone's "front" in Motive doesn't match actual front, adjust here
-        self.declare_parameter('yaw_offset_deg', 0.0)
-        
-        # What to send to Crazyflie from mocap:
-        # 'position_only' - Only position, no orientation (IMU handles orientation, yaw may drift)
-        # 'position_and_yaw' - Position + yaw only (best compromise: IMU for roll/pitch, mocap for yaw)
-        # 'full_pose' - Full 6DoF pose (may be noisy for orientation)
-        self.declare_parameter('mocap_mode', 'position_only')
-        # Trajectory CSV path for playback (time_ms, x, y, z, yaw). Press T while flying to play.
-        self.declare_parameter('trajectory_file', 'trajectory.csv')
-        # Trajectory offset [x, y, z, yaw_deg] in world frame.
-        # Each CSV point is applied as: world_target = trajectory_offset + trajectory_point.
-        # Trajectory point (0, 0, 0, 0) is located at trajectory_offset.
-        self.declare_parameter('trajectory_offset', [0.45, -0.55, 0.3, 0.0])
-        # x=0.390 y=-0.582 z=0.517
-        # Get parameters
-        self.uri = self.get_parameter('uri').value
-        self.use_mocap = self.get_parameter('use_mocap').value
-        self.axis_mapping = list(self.get_parameter('axis_mapping').value)
-        self.axis_sign = list(self.get_parameter('axis_sign').value)
-        self.yaw_offset_rad = math.radians(self.get_parameter('yaw_offset_deg').value)
-        self.mocap_mode = self.get_parameter('mocap_mode').value
-        self.trajectory_file = self.get_parameter('trajectory_file').value
-        self.trajectory_offset = list(self.get_parameter('trajectory_offset').value)
-        if len(self.trajectory_offset) != 4:
-            self.get_logger().warning(
-                f"trajectory_offset must have 4 values [x, y, z, yaw_deg]; got {self.trajectory_offset}. "
-                "Falling back to [0.0, 0.0, 0.0, 0.0]."
-            )
-            self.trajectory_offset = [0.0, 0.0, 0.0, 0.0]
-        else:
-            self.trajectory_offset = [float(v) for v in self.trajectory_offset]
-        
-        self.get_logger().info(f'URI: {self.uri}')
-        self.get_logger().info(f'Use MoCap: {self.use_mocap}')
-        self.get_logger().info(f'MoCap mode: {self.mocap_mode}')
-        self.get_logger().info(f'Axis mapping: {self.axis_mapping}')
-        self.get_logger().info(f'Axis sign: {self.axis_sign}')
-        self.get_logger().info(f'Yaw offset: {math.degrees(self.yaw_offset_rad):.1f}°')
-        self.get_logger().info(f'Trajectory offset [x, y, z, yaw_deg]: {self.trajectory_offset}')
-        
-        # Setup mocap if enabled
-        self.mocap_pose = None
-        self.mocap_lock = threading.Lock()
-        self.last_box_log_time = 0.0
-        
-        if self.use_mocap:
-            mocap_topic = self.get_parameter('mocap_topic').value
+        super().__init__("crazyflie_loihi_bridge_node")
+        self._declare_parameters()
+        self.config = self._load_config()
+        self.mocap_adapter = MocapAdapter(
+            self.config.axis_mapping,
+            self.config.axis_sign,
+            self.config.yaw_offset_rad,
+            self.config.mocap_mode,
+        )
+        self.bridge = CrazyflieLoihiBridge(self.config, self.mocap_adapter)
+
+        if self.config.use_mocap:
+            mocap_topic = self.get_parameter("mocap_topic").value
             self.mocap_sub = self.create_subscription(
                 PoseStamped,
                 mocap_topic,
                 self.mocap_callback,
-                10
+                10,
             )
-
-            self.box1_pose = None
-            self.box2_pose = None
-            self.box1_sub = self.create_subscription(
-                PoseStamped,
-                self.get_parameter('box1_topic').value,
-                self.box1_callback,
-                10
-            )
-            self.box2_sub = self.create_subscription(
-                PoseStamped,
-                self.get_parameter('box2_topic').value,
-                self.box2_callback,
-                10
-            )
-            self.get_logger().info(f'Subscribed to mocap topic: {mocap_topic}')
-            self.get_logger().info(f"Subscribed to box topics")
+            self.get_logger().info(f"Subscribed to mocap topic: {mocap_topic}")
         else:
-            self.get_logger().info('MoCap disabled - using Flow Deck only')
-        
-        # Create controller
-        self.controller = CrazyflieController(
-            self.uri,
-            use_mocap=self.use_mocap,
-            trajectory_file=self.trajectory_file,
-            trajectory_offset=self.trajectory_offset,
+            self.get_logger().warning("MoCap disabled; external-position updates will not be sent")
+
+        self._log_config()
+
+    def _declare_parameters(self) -> None:
+        self.declare_parameter("uri", URI)
+        self.declare_parameter("mocap_topic", "/optitrack/marker/pose")
+        self.declare_parameter("use_mocap", True)
+        self.declare_parameter("mocap_mode", "position_only")
+        self.declare_parameter("axis_mapping", [0, 1, 2])
+        self.declare_parameter("axis_sign", [1.0, 1.0, 1.0])
+        self.declare_parameter("yaw_offset_deg", 0.0)
+
+        self.declare_parameter("control_period_s", 0.01)
+        self.declare_parameter("extpos_period_s", 0.01)
+        self.declare_parameter("state_log_period_ms", 10)
+        self.declare_parameter("max_state_age_s", 0.1)
+        self.declare_parameter("max_mocap_age_s", 0.25)
+        self.declare_parameter("position_commands_enabled", False)
+        self.declare_parameter("auto_takeoff", False)
+        self.declare_parameter("auto_start_demo", False)
+        self.declare_parameter("arm_on_connect", False)
+        self.declare_parameter("takeoff_height_m", 0.5)
+        self.declare_parameter("takeoff_rate_mps", 0.25)
+        self.declare_parameter("land_rate_mps", 0.25)
+        self.declare_parameter("z_min_m", 0.1)
+        self.declare_parameter("z_max_m", 1.2)
+        self.declare_parameter("max_command_step_m", 0.05)
+        self.declare_parameter("fault_land_count", 40)
+
+        self.declare_parameter("fixed_yaw_deg", 0.0)
+        self.declare_parameter("reference_yaw_mode", "fixed")
+        self.declare_parameter("circle_radius_m", 0.25)
+        self.declare_parameter("circle_omega_rad_s", 0.35)
+        self.declare_parameter("circle_center", [0.0, 0.0, 0.5])
+        self.declare_parameter("box_l0_m", 0.7)
+        self.declare_parameter("box_delta_m", 0.2)
+        self.declare_parameter("box_omega_rad_s", 0.2)
+        self.declare_parameter("box_min_half_extent_m", 0.2)
+        self.declare_parameter("manual_step_m", 0.05)
+
+        self.declare_parameter("loihi_backend", "disabled")
+        self.declare_parameter("mock_error_gain", 0.0)
+        self.declare_parameter("loihi_admm_iterations", 45)
+        self.declare_parameter("loihi_parallel_components", 3)
+        self.declare_parameter("loihi_parallel_quant_bins", 750)
+        self.declare_parameter("loihi_vector_max_abs_int", -1)
+        self.declare_parameter("loihi_max_control_ticks", 60000)
+        self.declare_parameter("loihi_match_timeout_s", 0.05)
+        self.declare_parameter("max_loihi_latency_s", 0.05)
+        self.declare_parameter("loihi_ethernet_output_buffer_steps", 4096)
+        self.declare_parameter("admm_nxcore_path", default_admm_nxcore_path())
+        self.declare_parameter("log_file", "")
+        self.declare_parameter("print_every", 100)
+
+    def _load_config(self) -> BridgeConfig:
+        circle_center = list(self.get_parameter("circle_center").value)
+        if len(circle_center) != 3:
+            raise ValueError("circle_center must be [x, y, z].")
+        return BridgeConfig(
+            uri=str(self.get_parameter("uri").value),
+            use_mocap=bool(self.get_parameter("use_mocap").value),
+            mocap_mode=str(self.get_parameter("mocap_mode").value),
+            axis_mapping=[int(value) for value in list(self.get_parameter("axis_mapping").value)],
+            axis_sign=[float(value) for value in list(self.get_parameter("axis_sign").value)],
+            yaw_offset_rad=math.radians(float(self.get_parameter("yaw_offset_deg").value)),
+            control_period_s=float(self.get_parameter("control_period_s").value),
+            extpos_period_s=float(self.get_parameter("extpos_period_s").value),
+            state_log_period_ms=int(self.get_parameter("state_log_period_ms").value),
+            max_state_age_s=float(self.get_parameter("max_state_age_s").value),
+            max_mocap_age_s=float(self.get_parameter("max_mocap_age_s").value),
+            position_commands_enabled=bool(self.get_parameter("position_commands_enabled").value),
+            auto_takeoff=bool(self.get_parameter("auto_takeoff").value),
+            auto_start_demo=bool(self.get_parameter("auto_start_demo").value),
+            arm_on_connect=bool(self.get_parameter("arm_on_connect").value),
+            takeoff_height_m=float(self.get_parameter("takeoff_height_m").value),
+            takeoff_rate_mps=float(self.get_parameter("takeoff_rate_mps").value),
+            land_rate_mps=float(self.get_parameter("land_rate_mps").value),
+            z_min_m=float(self.get_parameter("z_min_m").value),
+            z_max_m=float(self.get_parameter("z_max_m").value),
+            max_command_step_m=float(self.get_parameter("max_command_step_m").value),
+            fault_land_count=int(self.get_parameter("fault_land_count").value),
+            fixed_yaw_deg=float(self.get_parameter("fixed_yaw_deg").value),
+            reference_yaw_mode=str(self.get_parameter("reference_yaw_mode").value),
+            circle_radius_m=float(self.get_parameter("circle_radius_m").value),
+            circle_omega_rad_s=float(self.get_parameter("circle_omega_rad_s").value),
+            circle_center_m=np.asarray(circle_center, dtype=np.float64),
+            box_l0_m=float(self.get_parameter("box_l0_m").value),
+            box_delta_m=float(self.get_parameter("box_delta_m").value),
+            box_omega_rad_s=float(self.get_parameter("box_omega_rad_s").value),
+            box_min_half_extent_m=float(self.get_parameter("box_min_half_extent_m").value),
+            manual_step_m=float(self.get_parameter("manual_step_m").value),
+            loihi_backend=str(self.get_parameter("loihi_backend").value),
+            mock_error_gain=float(self.get_parameter("mock_error_gain").value),
+            loihi_admm_iterations=int(self.get_parameter("loihi_admm_iterations").value),
+            loihi_parallel_components=int(self.get_parameter("loihi_parallel_components").value),
+            loihi_parallel_quant_bins=int(self.get_parameter("loihi_parallel_quant_bins").value),
+            loihi_vector_max_abs_int=int(self.get_parameter("loihi_vector_max_abs_int").value),
+            loihi_max_control_ticks=int(self.get_parameter("loihi_max_control_ticks").value),
+            loihi_match_timeout_s=float(self.get_parameter("loihi_match_timeout_s").value),
+            max_loihi_latency_s=float(self.get_parameter("max_loihi_latency_s").value),
+            loihi_ethernet_output_buffer_steps=int(
+                self.get_parameter("loihi_ethernet_output_buffer_steps").value
+            ),
+            admm_nxcore_path=str(self.get_parameter("admm_nxcore_path").value),
+            log_file=str(self.get_parameter("log_file").value),
+            print_every=int(self.get_parameter("print_every").value),
         )
-        
-    def mocap_callback(self, msg):
-        """Callback for mocap pose data"""
-        with self.mocap_lock:
-            self.mocap_pose = msg
-            # print("received pose from mocap", msg.pose.position.x, msg.pose.position.y, msg.pose.position.z)
-    
-    def box1_callback(self, msg):
-        with self.mocap_lock:
-            self.box1_pose = msg
 
-    def box2_callback(self, msg):
-        with self.mocap_lock:
-            self.box2_pose = msg
+    def _log_config(self) -> None:
+        self.get_logger().info(f"Crazyflie URI: {self.config.uri}")
+        self.get_logger().info(f"MoCap mode: {self.config.mocap_mode}")
+        self.get_logger().info(f"Axis mapping: {self.config.axis_mapping}")
+        self.get_logger().info(f"Axis sign: {self.config.axis_sign}")
+        self.get_logger().info(f"Loihi backend: {self.config.loihi_backend}")
+        self.get_logger().info(
+            f"Position commands enabled: {self.config.position_commands_enabled}"
+        )
+        self.get_logger().info(f"admm_nxcore path: {self.config.admm_nxcore_path}")
 
-    def get_mocap_data(self):
-        """
-        Get current mocap position data, transformed to Crazyflie frame.
-        
-        Applies:
-        1. Axis remapping (axis_mapping parameter)
-        2. Axis sign flipping (axis_sign parameter)
-        3. Yaw offset correction (yaw_offset_deg parameter)
-        
-        Returns: (x, y, z, qx, qy, qz, qw, mocap_mode, box_min_x, box_max_x)
-        """
-        with self.mocap_lock:
-            # Handle box constraints
-            box_min = None
-            box_max = None
-            if self.box1_pose is not None and self.box2_pose is not None:
-                box1_raw = [
-                    self.box1_pose.pose.position.x,
-                    self.box1_pose.pose.position.y,
-                    self.box1_pose.pose.position.z
-                ]
-                box2_raw = [
-                    self.box2_pose.pose.position.x,
-                    self.box2_pose.pose.position.y,
-                    self.box2_pose.pose.position.z
-                ]
-                # Transform box X coordinates using the same mapping as the drone
-                b1_x = self.axis_sign[0] * box1_raw[self.axis_mapping[0]]
-                b2_x = self.axis_sign[0] * box2_raw[self.axis_mapping[0]]
-                raw_box_min = min(b1_x, b2_x)
-                raw_box_max = max(b1_x, b2_x)
-                box_min = raw_box_min + OBSTACLE_MARGIN_M
-                box_max = raw_box_max - OBSTACLE_MARGIN_M
-                if box_min > box_max:
-                    midpoint = 0.5 * (raw_box_min + raw_box_max)
-                    box_min = midpoint
-                    box_max = midpoint
-                now = time.time()
-                if now - self.last_box_log_time >= 2.0:
-                    self.get_logger().info(
-                        "Boxes raw: "
-                        f"box1=({box1_raw[0]:.3f}, {box1_raw[1]:.3f}, {box1_raw[2]:.3f}) m, "
-                        f"box2=({box2_raw[0]:.3f}, {box2_raw[1]:.3f}, {box2_raw[2]:.3f}) m | "
-                        f"constraint_x: box1={b1_x:.3f} m, box2={b2_x:.3f} m, "
-                        f"margin={OBSTACLE_MARGIN_M:.2f} m, "
-                        f"min={box_min:.3f} m, max={box_max:.3f} m"
-                    )
-                    self.last_box_log_time = now
+    def mocap_callback(self, msg: PoseStamped) -> None:
+        self.mocap_adapter.update(msg)
 
-            if self.mocap_pose is None:
-                return (-30.0, -30.0, 0.0, 0.0, 0.0, 0.0, 1.0, self.mocap_mode, box_min, box_max)  # Invalid data
-            
-            # Raw mocap position data
-            pos_raw = [
-                self.mocap_pose.pose.position.x,
-                self.mocap_pose.pose.position.y,
-                self.mocap_pose.pose.position.z
-            ]
-            
-            # Apply axis mapping and sign to position
-            # axis_mapping[i] tells which raw axis to use for CF axis i
-            # axis_sign[i] tells the sign for CF axis i
-            x = self.axis_sign[0] * pos_raw[self.axis_mapping[0]]
-            y = self.axis_sign[1] * pos_raw[self.axis_mapping[1]]
-            z = self.axis_sign[2] * pos_raw[self.axis_mapping[2]]
-            
-            # For position_only mode (single marker), skip quaternion processing
-            # The quaternion from a single marker is meaningless
-            # Yaw will come from Crazyflie's IMU instead
-            if self.mocap_mode == 'position_only':
-                return (x, y, z, 0.0, 0.0, 0.0, 1.0, self.mocap_mode, box_min, box_max)
-            
-            # Process quaternion for modes that use mocap orientation
-            qx_raw = self.mocap_pose.pose.orientation.x
-            qy_raw = self.mocap_pose.pose.orientation.y
-            qz_raw = self.mocap_pose.pose.orientation.z
-            qw_raw = self.mocap_pose.pose.orientation.w
-            
-            # Remap quaternion vector part (qx, qy, qz) same as position
-            q_raw = [qx_raw, qy_raw, qz_raw]
-            qx = self.axis_sign[0] * q_raw[self.axis_mapping[0]]
-            qy = self.axis_sign[1] * q_raw[self.axis_mapping[1]]
-            qz = self.axis_sign[2] * q_raw[self.axis_mapping[2]]
-            qw = qw_raw
-            
-            # If we flipped an odd number of axes, we need to negate qw
-            # to maintain a proper rotation (determinant = 1)
-            sign_product = self.axis_sign[0] * self.axis_sign[1] * self.axis_sign[2]
-            if sign_product < 0:
-                qw = -qw
-            
-            # Apply yaw offset to correct for rigid body orientation in Motive
-            if self.yaw_offset_rad != 0.0:
-                qx, qy, qz, qw = apply_yaw_offset_to_quaternion(
-                    qx, qy, qz, qw, self.yaw_offset_rad
-                )
-            
-            return (x, y, z, qx, qy, qz, qw, self.mocap_mode, box_min, box_max)
-    
-    def run(self):
-        """Main run function"""
-        # Initialize cflib drivers
+    def run(self) -> None:
         cflib.crtp.init_drivers()
-        
         try:
-            with SyncCrazyflie(self.uri, cf=Crazyflie(rw_cache='./cache')) as scf:
-                cf = scf.cf
-                
-                self.get_logger().info("✓ Connected to Crazyflie")
-                time.sleep(1)
-                
-                # Set parameters for Flow Deck operation
-                parameters = {
-                    'stabilizer.controller': 1,  # 1 = PID controller
-                    'kalman.resetEstimation': 1,
-                }
-                
-                
-                parameters['stabilizer.estimator'] = 2  # Kalman filter for mocap
-                    
-                
-                self.controller.set_parameters(cf, parameters)
-                time.sleep(1)
-                
-                cf.param.set_value('stabilizer.estimator', '2')
-                
-
-                # Reset the estimation
-                cf.param.set_value('kalman.resetEstimation', '0')
-                time.sleep(0.5)
-                
-                # Arm the motors
-                cf.platform.send_arming_request(True)
-                self.get_logger().info("✓ Armed - motors ready")
-                time.sleep(1.0)
-                
-                # Run the control loop
-                mocap_func = self.get_mocap_data if self.use_mocap else None
-                self.controller.run_control_loop(scf, mocap_func=mocap_func)
-                
-                self.get_logger().info("✓ Flight completed")
-                
-        except Exception as e:
-            self.get_logger().error(f"❌ Error: {e}")
-            import traceback
+            with SyncCrazyflie(self.config.uri, cf=Crazyflie(rw_cache="./cache")) as scf:
+                self.get_logger().info("Connected to Crazyflie")
+                self.bridge.run(scf)
+        except Exception as exc:
+            self.get_logger().error(f"Crazyflie bridge error: {exc}")
             traceback.print_exc()
 
 
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
-    
     node = CrazyflieROS2Node()
-    
-    # Run the crazyflie control in a separate thread
-    # so ROS2 can still spin and receive mocap messages
-    cf_thread = threading.Thread(target=node.run, daemon=True)
-    cf_thread.start()
-    
+    ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    ros_thread.start()
+
     try:
-        rclpy.spin(node)
+        node.run()
     except KeyboardInterrupt:
-        node.get_logger().info('Keyboard interrupt, shutting down')
+        node.get_logger().info("Keyboard interrupt, shutting down")
     finally:
-        node.controller.request_shutdown()
+        node.bridge.request_shutdown()
         node.destroy_node()
-        rclpy.shutdown()
-        cf_thread.join(timeout=2)
+        if rclpy.ok():
+            rclpy.shutdown()
+        ros_thread.join(timeout=5.0)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
