@@ -10,8 +10,9 @@ BRIDGE_ARGS ?=
 BRIDGE_BASE_ARGS ?= --ros-args -p admm_nxcore_path:=$(NEUROMORPHIC_ROOT)/admm_nxcore
 PLOT_LOG ?=
 PLOT_ARGS ?=
+DEMO_PLAN_ARGS ?=
 
-.PHONY: build run attach loihi-shell setup-ssh build-ws setup-intel-cflib rebuild-nx-streaming-output smoke smoke-ssh bridge-log bridge-mock bridge-real plot-loihi-log
+.PHONY: build run attach loihi-shell setup-ssh build-ws setup-intel-cflib rebuild-nx-streaming-output smoke smoke-ssh bridge-log bridge-mock bridge-float bridge-real plot-loihi-log plot-demo-plan
 
 build:
 	docker build . -t $(IMAGE)
@@ -68,8 +69,14 @@ bridge-log:
 bridge-mock:
 	docker exec -it $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && source $(CRAZYFLIE_WS)/install/setup.sh && source /intel/variables.sh eth && source /intel/venv/bin/activate && cd $(CRAZYFLIE_WS) && python3 -m crazyflie_bridge.crazyflie_bridge_node $(BRIDGE_BASE_ARGS) -p arm_on_connect:=false -p position_commands_enabled:=false -p loihi_backend:=mock $(BRIDGE_ARGS)'
 
+bridge-float:
+	docker exec -it $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && source $(CRAZYFLIE_WS)/install/setup.sh && source /intel/variables.sh eth && source /intel/venv/bin/activate && cd $(CRAZYFLIE_WS) && python3 -m crazyflie_bridge.crazyflie_bridge_node $(BRIDGE_BASE_ARGS) -p arm_on_connect:=false -p position_commands_enabled:=false -p loihi_backend:=host_float $(BRIDGE_ARGS)'
+
 bridge-real:
 	docker exec -it $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && source $(CRAZYFLIE_WS)/install/setup.sh && source /intel/variables.sh eth && source /intel/venv/bin/activate && cd $(CRAZYFLIE_WS) && python3 -m crazyflie_bridge.crazyflie_bridge_node $(BRIDGE_BASE_ARGS) -p arm_on_connect:=false -p position_commands_enabled:=false -p loihi_backend:=real $(BRIDGE_ARGS)'
 
 plot-loihi-log:
 	docker exec $(CONTAINER) bash -lc 'source /intel/venv/bin/activate && cd $(CRAZYFLIE_WS) && python3 plot_loihi_bridge_log.py $(PLOT_LOG) $(PLOT_ARGS)'
+
+plot-demo-plan:
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && source $(CRAZYFLIE_WS)/install/setup.sh && source /intel/venv/bin/activate && cd $(CRAZYFLIE_WS) && python3 plot_loihi_demo_plan.py $(DEMO_PLAN_ARGS)'

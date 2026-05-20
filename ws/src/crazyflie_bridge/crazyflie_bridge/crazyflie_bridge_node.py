@@ -31,6 +31,17 @@ from rclpy.node import Node
 
 
 URI = uri_helper.uri_from_env(default="radio://0/80/2M/E7E7E7E7E7")
+DEFAULT_CIRCLE_RADIUS_M = 0.25
+DEFAULT_CIRCLE_OMEGA_RAD_S = 1.40
+DEFAULT_CIRCLE_CENTER_M = [0.0, 0.0, 0.5]
+DEFAULT_BOX_OPEN_HALF_EXTENT_M = 0.7
+DEFAULT_BOX_NARROW_HALF_EXTENT_M = 0.08
+DEFAULT_BOX_INITIAL_OPEN_PERIODS = 1.5
+DEFAULT_BOX_AXIS_SHRINK_PERIODS = 0.7
+DEFAULT_BOX_AXIS_HOLD_PERIODS = 2.0
+DEFAULT_BOX_AXIS_OPEN_PERIODS = 1.0
+DEFAULT_BOX_BETWEEN_AXES_OPEN_PERIODS = 0.75
+DEFAULT_BOX_FINAL_OPEN_PERIODS = 1.0
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -206,9 +217,15 @@ class BridgeConfig:
     circle_omega_rad_s: float
     circle_center_m: np.ndarray
     box_l0_m: float
-    box_delta_m: float
-    box_omega_rad_s: float
     box_min_half_extent_m: float
+    box_initial_open_periods: float
+    box_axis_shrink_periods: float
+    box_axis_hold_periods: float
+    box_axis_open_periods: float
+    box_between_axes_open_periods: float
+    box_final_open_periods: float
+    box_schedule_mode: str
+    box_fixed_duration_s: float
     manual_step_m: float
     loihi_backend: str
     mock_error_gain: float
@@ -217,6 +234,9 @@ class BridgeConfig:
     loihi_parallel_quant_bins: int
     loihi_vector_max_abs_int: int
     loihi_max_control_ticks: int
+    loihi_selected_position_index: int
+    loihi_xy_dynamic_bounds_start_index: int
+    loihi_no_warm_start: bool
     loihi_match_timeout_s: float
     max_loihi_latency_s: float
     loihi_ethernet_output_buffer_steps: int
@@ -403,6 +423,8 @@ class MocapAdapter:
 class CircleReferenceGenerator:
     def __init__(self, config: BridgeConfig):
         self.config = config
+        if self.config.box_schedule_mode not in ("staged", "fixed"):
+            raise ValueError("box_schedule_mode must be 'staged' or 'fixed'")
 
     def reference_at(self, elapsed_s: float, yaw_hold_rad: float) -> ReferencePoint:
         t_s = float(elapsed_s)
@@ -440,21 +462,96 @@ class DynamicBoundsShifter:
     def __init__(self, config: BridgeConfig):
         self.config = config
 
+    def cycle_period_s(self) -> float:
+        if self.config.box_schedule_mode == "fixed":
+            fixed_duration_s = float(self.config.box_fixed_duration_s)
+            if fixed_duration_s > 0.0:
+                return fixed_duration_s
+            omega = max(abs(float(self.config.circle_omega_rad_s)), 1.0e-6)
+            return 2.0 * math.pi / omega
+        omega = max(abs(float(self.config.circle_omega_rad_s)), 1.0e-6)
+        circle_period_s = 2.0 * math.pi / omega
+        initial_open = max(0.0, float(self.config.box_initial_open_periods))
+        shrink = max(1.0e-6, float(self.config.box_axis_shrink_periods))
+        hold = max(0.0, float(self.config.box_axis_hold_periods))
+        reopen = max(1.0e-6, float(self.config.box_axis_open_periods))
+        between_axes = max(0.0, float(self.config.box_between_axes_open_periods))
+        final_open = max(0.0, float(self.config.box_final_open_periods))
+        axis_stage = shrink + hold + reopen
+        return (initial_open + axis_stage + between_axes + axis_stage + final_open) * circle_period_s
+
+    def _staged_half_extents(self, t_s: float) -> Tuple[float, float]:
+        open_extent = float(self.config.box_l0_m)
+        narrow_extent = min(open_extent, float(self.config.box_min_half_extent_m))
+        if self.config.box_schedule_mode == "fixed":
+            return narrow_extent, narrow_extent
+        omega = max(abs(float(self.config.circle_omega_rad_s)), 1.0e-6)
+        circle_period_s = 2.0 * math.pi / omega
+        initial_open = max(0.0, float(self.config.box_initial_open_periods))
+        shrink = max(1.0e-6, float(self.config.box_axis_shrink_periods))
+        hold = max(0.0, float(self.config.box_axis_hold_periods))
+        reopen = max(1.0e-6, float(self.config.box_axis_open_periods))
+        between_axes = max(0.0, float(self.config.box_between_axes_open_periods))
+        final_open = max(0.0, float(self.config.box_final_open_periods))
+        axis_stage = shrink + hold + reopen
+        cycle_periods = initial_open + axis_stage + between_axes + axis_stage + final_open
+        phase = (float(t_s) % (cycle_periods * circle_period_s)) / circle_period_s
+
+        lx = open_extent
+        ly = open_extent
+        x_start = initial_open
+        y_start = initial_open + axis_stage + between_axes
+        if x_start <= phase < x_start + axis_stage:
+            lx = self._shrink_hold_open_extent(
+                phase - x_start,
+                open_extent,
+                narrow_extent,
+                shrink,
+                hold,
+                reopen,
+            )
+        elif y_start <= phase < y_start + axis_stage:
+            ly = self._shrink_hold_open_extent(
+                phase - y_start,
+                open_extent,
+                narrow_extent,
+                shrink,
+                hold,
+                reopen,
+            )
+        return lx, ly
+
+    @staticmethod
+    def _shrink_hold_open_extent(
+        stage_phase: float,
+        open_extent: float,
+        narrow_extent: float,
+        shrink_periods: float,
+        hold_periods: float,
+        open_periods: float,
+    ) -> float:
+        if stage_phase < shrink_periods:
+            progress = stage_phase / shrink_periods
+            return open_extent + progress * (narrow_extent - open_extent)
+        if stage_phase < shrink_periods + hold_periods:
+            return narrow_extent
+        progress = (stage_phase - shrink_periods - hold_periods) / open_periods
+        return narrow_extent + progress * (open_extent - narrow_extent)
+
     def bounds_for(self, reference: ReferencePoint) -> np.ndarray:
-        l0 = float(self.config.box_l0_m)
-        delta = float(self.config.box_delta_m)
-        omega = float(self.config.box_omega_rad_s)
-        min_extent = float(self.config.box_min_half_extent_m)
-        lx = max(min_extent, l0 + delta * math.sin(omega * reference.t_s))
-        ly = max(min_extent, l0 + delta * math.cos(omega * reference.t_s))
+        lx, ly = self._staged_half_extents(reference.t_s)
         x_ref = float(reference.position_m[0])
         y_ref = float(reference.position_m[1])
+        world_x_min = -lx
+        world_x_max = lx
+        world_y_min = -ly
+        world_y_max = ly
         return np.asarray(
             [
-                -lx - x_ref,
-                lx - x_ref,
-                -ly - y_ref,
-                ly - y_ref,
+                x_ref - world_x_max,
+                x_ref - world_x_min,
+                y_ref - world_y_max,
+                y_ref - world_y_min,
             ],
             dtype=np.float64,
         )
@@ -498,6 +595,149 @@ class MockLoihiBackend(BaseLoihiBackend):
             latency_s=time.monotonic() - start_s,
             raw_output=None,
         )
+
+
+class HostFloatLoihiBackend(BaseLoihiBackend):
+    name = "host_float"
+
+    def __init__(self, config: BridgeConfig):
+        self.config = config
+        self.problem_data = None
+        self.A = None
+        self.ATrho = None
+        self.L = None
+        self.z_state = None
+        self.y_state = None
+        self.lower = None
+        self.upper = None
+        self.state_dim = 0
+        self.control_dim = 4
+        self.equality_rows = 0
+        self.input_inequality_rows = 0
+        self.xy_inequality_rows = 0
+        self.horizon = 0
+        self.selected_position_index = 1
+        self._prepare_import_path()
+
+    def _prepare_import_path(self) -> Path:
+        admm_path = Path(self.config.admm_nxcore_path).expanduser().resolve()
+        if not admm_path.is_dir():
+            raise RuntimeError(f"admm_nxcore path does not exist: {admm_path}")
+        if str(admm_path) not in sys.path:
+            sys.path.insert(0, str(admm_path))
+        return admm_path
+
+    def start(self, initial_state: np.ndarray) -> None:
+        self._prepare_import_path()
+        from admm_mpc.direct import infer_inequality_split
+        from script.header_generator import build_default_bounds, get_solver_problem_data
+
+        problem_data = get_solver_problem_data()
+        self.problem_data = problem_data
+        self.A = np.asarray(problem_data["A"], dtype=np.float64)
+        self.ATrho = np.asarray(problem_data["ATrho"], dtype=np.float64)
+        self.L = np.asarray(problem_data["L"], dtype=np.float64)
+        self.state_dim = int(problem_data["n"])
+        self.control_dim = int(problem_data["m"])
+        self.equality_rows = int(problem_data["A_eq"].shape[0])
+        (
+            self.input_inequality_rows,
+            self.xy_inequality_rows,
+            self.horizon,
+        ) = infer_inequality_split(
+            self.A.shape[0],
+            self.equality_rows,
+            self.control_dim,
+        )
+        selected_index = int(self.config.loihi_selected_position_index)
+        if selected_index < 0:
+            selected_index = self.horizon
+        if selected_index < 1 or selected_index > self.horizon:
+            raise ValueError(
+                "loihi_selected_position_index must be in 1..horizon or negative for terminal; "
+                f"got {self.config.loihi_selected_position_index} with horizon={self.horizon}."
+            )
+        self.selected_position_index = selected_index
+
+        initial_state = np.asarray(initial_state, dtype=np.float64)
+        if initial_state.shape[0] != self.state_dim:
+            raise ValueError(
+                f"initial_state must have length {self.state_dim}, got {initial_state.shape[0]}"
+            )
+        self.lower, self.upper = build_default_bounds(np.zeros(self.state_dim, dtype=np.float64))
+        self.z_state = np.zeros(self.A.shape[0], dtype=np.float64)
+        self.y_state = np.zeros(self.A.shape[0], dtype=np.float64)
+        self.z_state[: self.state_dim] = initial_state
+        LOGGER.info(
+            "Starting host-float ADMM backend: iterations=%d selected_position_index=%d horizon=%d",
+            int(self.config.loihi_admm_iterations),
+            self.selected_position_index,
+            self.horizon,
+        )
+
+    def solve(self, request: LoihiRequest) -> Optional[LoihiResult]:
+        if self.z_state is None or self.y_state is None:
+            raise RuntimeError("Host-float backend has not been started.")
+        start_s = time.monotonic()
+        current_state = np.asarray(request.state_error, dtype=np.float64)
+        if current_state.shape[0] != self.state_dim:
+            raise ValueError(
+                f"state_error must have length {self.state_dim}, got {current_state.shape[0]}"
+            )
+
+        lower = np.asarray(self.lower, dtype=np.float64).copy()
+        upper = np.asarray(self.upper, dtype=np.float64).copy()
+        xy_lower, xy_upper = self._expand_xy_bounds_float(request.bounds_error_xy)
+        xy_start = self.equality_rows + self.input_inequality_rows
+        xy_end = xy_start + self.xy_inequality_rows
+        lower[xy_start:xy_end] = xy_lower
+        upper[xy_start:xy_end] = xy_upper
+
+        z_state = self.z_state.copy()
+        y_state = self.y_state.copy()
+        z_state[: self.state_dim] = current_state
+        x = np.zeros(self.A.shape[1], dtype=np.float64)
+        for _ in range(int(self.config.loihi_admm_iterations)):
+            rhs = self.ATrho @ (z_state - y_state)
+            w = np.linalg.solve(self.L, rhs)
+            x = np.linalg.solve(self.L.T, w)
+            v = self.A @ x + y_state
+            z_next = np.empty_like(v)
+            z_next[: self.state_dim] = current_state
+            z_next[self.state_dim : self.equality_rows] = 0.0
+            z_next[self.equality_rows :] = np.minimum(
+                np.maximum(v[self.equality_rows :], lower[self.equality_rows :]),
+                upper[self.equality_rows :],
+            )
+            y_state = v - z_next
+            z_state = z_next
+
+        self.z_state = z_state
+        self.y_state = y_state
+        u0_start = self.state_dim
+        selected_start = self.selected_position_index * (self.state_dim + self.control_dim)
+        return LoihiResult(
+            output_epoch=int(request.epoch),
+            u0=np.asarray(x[u0_start : u0_start + self.control_dim], dtype=np.float64),
+            selected_error_position_m=np.asarray(
+                x[selected_start : selected_start + 3],
+                dtype=np.float64,
+            ),
+            latency_s=time.monotonic() - start_s,
+            raw_output=None,
+        )
+
+    def _expand_xy_bounds_float(self, bounds_error_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        bounds = np.asarray(bounds_error_xy, dtype=np.float64)
+        if bounds.shape[0] != 4:
+            raise ValueError("xy bounds must be [x_min, x_max, y_min, y_max].")
+        lower = np.empty(2 * self.horizon, dtype=np.float64)
+        upper = np.empty(2 * self.horizon, dtype=np.float64)
+        lower[0::2] = bounds[0]
+        lower[1::2] = bounds[2]
+        upper[0::2] = bounds[1]
+        upper[1::2] = bounds[3]
+        return lower, upper
 
 
 class RealLoihiBackend(BaseLoihiBackend):
@@ -594,20 +834,28 @@ class RealLoihiBackend(BaseLoihiBackend):
             repeated_pipeline,
             parallel_components=int(self.config.loihi_parallel_components),
             parallel_quant_bins=int(self.config.loihi_parallel_quant_bins),
+            selected_position_index=int(self.config.loihi_selected_position_index),
+            xy_dynamic_bounds_start_index=int(self.config.loihi_xy_dynamic_bounds_start_index),
         )
+        self.selected_position_index = int(direct_pipeline.selected_position_index)
 
         y0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
         z0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
         initial_state_int = quantize_vector(initial_state, vector_exp)
         z0_int[:n_state] = initial_state_int
-        input_periods = int(self.config.loihi_admm_iterations)
+        preload_periods = 1 if bool(self.config.loihi_no_warm_start) else 0
+        input_periods = int(self.config.loihi_admm_iterations) + preload_periods
         run_periods = max(1, int(self.config.loihi_max_control_ticks) * input_periods)
 
         LOGGER.info(
-            "Starting DirectSelectedStreamingEthernetSession: ticks=%d admm_iterations=%d vector_exp=%d",
+            "Starting DirectSelectedStreamingEthernetSession: ticks=%d admm_iterations=%d input_periods=%d vector_exp=%d selected_position_index=%d xy_dynamic_bounds_start_index=%d no_warm_start=%s",
             int(self.config.loihi_max_control_ticks),
+            int(self.config.loihi_admm_iterations),
             input_periods,
             int(vector_exp),
+            self.selected_position_index,
+            int(self.config.loihi_xy_dynamic_bounds_start_index),
+            bool(self.config.loihi_no_warm_start),
         )
         self.session = DirectSelectedStreamingEthernetSession(
             direct_pipeline,
@@ -620,6 +868,8 @@ class RealLoihiBackend(BaseLoihiBackend):
             fresh_epoch_gate=True,
             dynamic_xy_bounds=True,
             ethernet_output_buffer_steps=int(self.config.loihi_ethernet_output_buffer_steps),
+            selected_output_mode="selected_xyz",
+            resident_cold_start=bool(self.config.loihi_no_warm_start),
         )
 
     def solve(self, request: LoihiRequest) -> Optional[LoihiResult]:
@@ -639,11 +889,15 @@ class RealLoihiBackend(BaseLoihiBackend):
         raw = np.asarray(latest["x"], dtype=np.int64)
         output_epoch = int(latest["epoch"])
         offset = 1
-        u0 = self._dequantize_vector(raw[offset : offset + self.control_dim], self.vector_exp)
-        selected_error_position = self._dequantize_vector(
-            raw[offset + self.control_dim : offset + self.control_dim + 3],
-            self.vector_exp,
-        )
+        if raw.shape[0] == 1 + 3:
+            u0 = np.zeros(self.control_dim, dtype=np.float64)
+            selected_error_position = self._dequantize_vector(raw[offset : offset + 3], self.vector_exp)
+        else:
+            u0 = self._dequantize_vector(raw[offset : offset + self.control_dim], self.vector_exp)
+            selected_error_position = self._dequantize_vector(
+                raw[offset + self.control_dim : offset + self.control_dim + 3],
+                self.vector_exp,
+            )
         latency_s = latest.get("state_to_output_latency_s")
         if latency_s is None:
             latency_s = time.monotonic() - request.sent_s
@@ -773,14 +1027,15 @@ class BridgeCsvLogger:
         "bound_ey_max",
         "request_epoch",
         "output_epoch",
+        "selected_position_index",
         "loihi_latency_s",
         "u0_0",
         "u0_1",
         "u0_2",
         "u0_3",
-        "selected_ep1_x",
-        "selected_ep1_y",
-        "selected_ep1_z",
+        "selected_ep_x",
+        "selected_ep_y",
+        "selected_ep_z",
         "cmd_x",
         "cmd_y",
         "cmd_z",
@@ -846,6 +1101,7 @@ class CrazyflieLoihiBridge:
     MODE_IDLE = "IDLE"
     MODE_TAKEOFF = "TAKEOFF"
     MODE_HOLD = "HOLD"
+    MODE_STAGE_DEMO = "STAGE_DEMO"
     MODE_DEMO = "LOIHI_DEMO"
     MODE_MANUAL = "LOIHI_MANUAL"
     MODE_LANDING = "LANDING"
@@ -880,9 +1136,11 @@ class CrazyflieLoihiBridge:
             return DisabledLoihiBackend()
         if backend == "mock":
             return MockLoihiBackend(config.mock_error_gain)
+        if backend == "host_float":
+            return HostFloatLoihiBackend(config)
         if backend == "real":
             return RealLoihiBackend(config)
-        raise ValueError("loihi_backend must be one of: disabled, mock, real")
+        raise ValueError("loihi_backend must be one of: disabled, mock, host_float, real")
 
     def request_shutdown(self) -> None:
         self.shutdown_requested.set()
@@ -962,7 +1220,7 @@ class CrazyflieLoihiBridge:
     def _print_controls(self) -> None:
         LOGGER.info(
             "Controls: t=takeoff, n=manual Loihi, wasd=manual x/y, +/-=manual z, "
-            "m=start Loihi trajectory, h=hold, l=land, q=land and quit"
+            "g=go to trajectory start, m=start Loihi trajectory, h=hold, l=land, q=land and quit"
         )
         LOGGER.info("Loihi backend: %s; position commands enabled: %s", self.backend.name, self.command_adapter.enabled)
 
@@ -971,6 +1229,8 @@ class CrazyflieLoihiBridge:
             self._start_takeoff()
         elif key == "n":
             self._start_manual_loihi()
+        elif key == "g":
+            self._start_stage_demo()
         elif key == "m":
             self._start_demo()
         elif key == "h":
@@ -1023,6 +1283,19 @@ class CrazyflieLoihiBridge:
         self.demo_start_s = time.monotonic()
         self.mode = self.MODE_DEMO
         LOGGER.info("Started Loihi circular-reference box demo")
+
+    def _start_stage_demo(self) -> None:
+        state = self.state_adapter.latest()
+        yaw_rad = state.yaw_rad if state is not None else self.demo_yaw_hold_rad
+        self.demo_yaw_hold_rad = yaw_rad
+        reference = self.reference_generator.reference_at(0.0, yaw_rad)
+        target = np.asarray(reference.position_m, dtype=np.float64).copy()
+        target[2] = float(np.clip(target[2], self.config.z_min_m, self.config.z_max_m))
+        self.hold_command = Command(position_m=target, yaw_rad=reference.yaw_rad)
+        self.demo_start_s = None
+        self.manual_reference_position = None
+        self.mode = self.MODE_STAGE_DEMO
+        LOGGER.info("Moving to Loihi demo start %.3f %.3f %.3f", *target)
 
     def _start_manual_loihi(self) -> None:
         if self.backend.name == "disabled":
@@ -1127,6 +1400,8 @@ class CrazyflieLoihiBridge:
                 LOGGER.info("Takeoff complete")
         elif self.mode == self.MODE_HOLD:
             command = self.hold_command
+        elif self.mode == self.MODE_STAGE_DEMO:
+            command = self._stage_demo_command()
         elif self.mode == self.MODE_LANDING:
             command = self._landing_command(dt_s)
         elif self.mode == self.MODE_DEMO:
@@ -1171,6 +1446,13 @@ class CrazyflieLoihiBridge:
         self.hold_command = Command(position_m=next_pos, yaw_rad=self.hold_command.yaw_rad)
         return self.hold_command
 
+    def _stage_demo_command(self) -> Command:
+        reference = self.reference_generator.reference_at(0.0, self.demo_yaw_hold_rad)
+        target = np.asarray(reference.position_m, dtype=np.float64).copy()
+        target[2] = float(np.clip(target[2], self.config.z_min_m, self.config.z_max_m))
+        self.hold_command = Command(position_m=target, yaw_rad=reference.yaw_rad)
+        return self.hold_command
+
     def _landing_command(self, dt_s: float) -> Command:
         if self.hold_command is None:
             state = self.state_adapter.latest()
@@ -1199,9 +1481,14 @@ class CrazyflieLoihiBridge:
         if self.demo_start_s is None:
             self.demo_start_s = now_s
         elapsed_s = now_s - self.demo_start_s
+        demo_duration_s = self.bounds_shifter.cycle_period_s()
+        if elapsed_s >= demo_duration_s:
+            LOGGER.info("Loihi demo complete after %.2f s; switching to hold", elapsed_s)
+            self._start_hold()
+            return self.hold_command, {}
         reference_now = self.reference_generator.reference_at(elapsed_s, self.demo_yaw_hold_rad)
         reference_next = self.reference_generator.reference_at(
-            elapsed_s + self.config.control_period_s,
+            elapsed_s + self.config.control_period_s * self._selected_reference_steps(),
             self.demo_yaw_hold_rad,
         )
         return self._loihi_reference_command(state, reference_now, reference_next)
@@ -1236,7 +1523,7 @@ class CrazyflieLoihiBridge:
         reference_next: ReferencePoint,
     ) -> Tuple[Optional[Command], Dict[str, object]]:
         row: Dict[str, object] = {}
-        bounds_error_xy = self.bounds_shifter.bounds_for(reference_now)
+        bounds_error_xy = self.bounds_shifter.bounds_for(reference_next)
         state_error = self._build_loihi_state_error(state, reference_now)
 
         self.epoch += 1
@@ -1295,6 +1582,16 @@ class CrazyflieLoihiBridge:
                 state.gyro_rad_s,
             ]
         ).astype(np.float64)
+
+    def _selected_reference_steps(self) -> int:
+        backend_index = int(
+            getattr(
+                self.backend,
+                "selected_position_index",
+                int(self.config.loihi_selected_position_index),
+            )
+        )
+        return max(1, backend_index)
 
     def _hold_current_position(self, state: FirmwareState) -> Command:
         command = Command(position_m=state.position_m.copy(), yaw_rad=state.yaw_rad)
@@ -1378,14 +1675,15 @@ class CrazyflieLoihiBridge:
         u0[: min(4, result.u0.shape[0])] = result.u0[: min(4, result.u0.shape[0])]
         return {
             "output_epoch": int(result.output_epoch),
+            "selected_position_index": self._selected_reference_steps(),
             "loihi_latency_s": f"{result.latency_s:.6f}",
             "u0_0": f"{u0[0]:.6f}",
             "u0_1": f"{u0[1]:.6f}",
             "u0_2": f"{u0[2]:.6f}",
             "u0_3": f"{u0[3]:.6f}",
-            "selected_ep1_x": f"{result.selected_error_position_m[0]:.6f}",
-            "selected_ep1_y": f"{result.selected_error_position_m[1]:.6f}",
-            "selected_ep1_z": f"{result.selected_error_position_m[2]:.6f}",
+            "selected_ep_x": f"{result.selected_error_position_m[0]:.6f}",
+            "selected_ep_y": f"{result.selected_error_position_m[1]:.6f}",
+            "selected_ep_z": f"{result.selected_error_position_m[2]:.6f}",
         }
 
     def _print_status(self, row: Dict[str, object]) -> None:
@@ -1444,28 +1742,34 @@ class CrazyflieROS2Node(Node):
         self.declare_parameter("state_log_period_ms", 10)
         self.declare_parameter("max_state_age_s", 0.1)
         self.declare_parameter("max_mocap_age_s", 0.25)
-        self.declare_parameter("position_commands_enabled", False)
+        self.declare_parameter("position_commands_enabled", True)
         self.declare_parameter("auto_takeoff", False)
         self.declare_parameter("auto_start_demo", False)
-        self.declare_parameter("arm_on_connect", False)
+        self.declare_parameter("arm_on_connect", True)
         self.declare_parameter("takeoff_height_m", 0.5)
         self.declare_parameter("takeoff_rate_mps", 0.25)
         self.declare_parameter("land_rate_mps", 0.25)
-        self.declare_parameter("z_min_m", 0.1)
-        self.declare_parameter("z_max_m", 1.2)
-        self.declare_parameter("max_command_step_m", 0.05)
-        self.declare_parameter("fault_land_count", 40)
+        self.declare_parameter("z_min_m", 0.15)
+        self.declare_parameter("z_max_m", 0.8)
+        self.declare_parameter("max_command_step_m", 0.015)
+        self.declare_parameter("fault_land_count", 10)
 
         self.declare_parameter("fixed_yaw_deg", 0.0)
         self.declare_parameter("reference_yaw_mode", "fixed")
-        self.declare_parameter("circle_radius_m", 0.25)
-        self.declare_parameter("circle_omega_rad_s", 0.35)
-        self.declare_parameter("circle_center", [0.0, 0.0, 0.5])
-        self.declare_parameter("box_l0_m", 0.7)
-        self.declare_parameter("box_delta_m", 0.2)
-        self.declare_parameter("box_omega_rad_s", 0.2)
-        self.declare_parameter("box_min_half_extent_m", 0.2)
-        self.declare_parameter("manual_step_m", 0.05)
+        self.declare_parameter("circle_radius_m", DEFAULT_CIRCLE_RADIUS_M)
+        self.declare_parameter("circle_omega_rad_s", DEFAULT_CIRCLE_OMEGA_RAD_S)
+        self.declare_parameter("circle_center", DEFAULT_CIRCLE_CENTER_M)
+        self.declare_parameter("box_l0_m", DEFAULT_BOX_OPEN_HALF_EXTENT_M)
+        self.declare_parameter("box_min_half_extent_m", DEFAULT_BOX_NARROW_HALF_EXTENT_M)
+        self.declare_parameter("box_initial_open_periods", DEFAULT_BOX_INITIAL_OPEN_PERIODS)
+        self.declare_parameter("box_axis_shrink_periods", DEFAULT_BOX_AXIS_SHRINK_PERIODS)
+        self.declare_parameter("box_axis_hold_periods", DEFAULT_BOX_AXIS_HOLD_PERIODS)
+        self.declare_parameter("box_axis_open_periods", DEFAULT_BOX_AXIS_OPEN_PERIODS)
+        self.declare_parameter("box_between_axes_open_periods", DEFAULT_BOX_BETWEEN_AXES_OPEN_PERIODS)
+        self.declare_parameter("box_final_open_periods", DEFAULT_BOX_FINAL_OPEN_PERIODS)
+        self.declare_parameter("box_schedule_mode", "staged")
+        self.declare_parameter("box_fixed_duration_s", 30.0)
+        self.declare_parameter("manual_step_m", 0.03)
 
         self.declare_parameter("loihi_backend", "disabled")
         self.declare_parameter("mock_error_gain", 0.0)
@@ -1474,12 +1778,15 @@ class CrazyflieROS2Node(Node):
         self.declare_parameter("loihi_parallel_quant_bins", 750)
         self.declare_parameter("loihi_vector_max_abs_int", -1)
         self.declare_parameter("loihi_max_control_ticks", 60000)
-        self.declare_parameter("loihi_match_timeout_s", 0.05)
-        self.declare_parameter("max_loihi_latency_s", 0.05)
+        self.declare_parameter("loihi_selected_position_index", -1)
+        self.declare_parameter("loihi_xy_dynamic_bounds_start_index", 1)
+        self.declare_parameter("loihi_no_warm_start", False)
+        self.declare_parameter("loihi_match_timeout_s", 0.1)
+        self.declare_parameter("max_loihi_latency_s", 0.1)
         self.declare_parameter("loihi_ethernet_output_buffer_steps", 4096)
         self.declare_parameter("admm_nxcore_path", default_admm_nxcore_path())
         self.declare_parameter("log_file", "")
-        self.declare_parameter("print_every", 100)
+        self.declare_parameter("print_every", 20)
 
     def _load_config(self) -> BridgeConfig:
         circle_center = list(self.get_parameter("circle_center").value)
@@ -1514,9 +1821,17 @@ class CrazyflieROS2Node(Node):
             circle_omega_rad_s=float(self.get_parameter("circle_omega_rad_s").value),
             circle_center_m=np.asarray(circle_center, dtype=np.float64),
             box_l0_m=float(self.get_parameter("box_l0_m").value),
-            box_delta_m=float(self.get_parameter("box_delta_m").value),
-            box_omega_rad_s=float(self.get_parameter("box_omega_rad_s").value),
             box_min_half_extent_m=float(self.get_parameter("box_min_half_extent_m").value),
+            box_initial_open_periods=float(self.get_parameter("box_initial_open_periods").value),
+            box_axis_shrink_periods=float(self.get_parameter("box_axis_shrink_periods").value),
+            box_axis_hold_periods=float(self.get_parameter("box_axis_hold_periods").value),
+            box_axis_open_periods=float(self.get_parameter("box_axis_open_periods").value),
+            box_between_axes_open_periods=float(
+                self.get_parameter("box_between_axes_open_periods").value
+            ),
+            box_final_open_periods=float(self.get_parameter("box_final_open_periods").value),
+            box_schedule_mode=str(self.get_parameter("box_schedule_mode").value),
+            box_fixed_duration_s=float(self.get_parameter("box_fixed_duration_s").value),
             manual_step_m=float(self.get_parameter("manual_step_m").value),
             loihi_backend=str(self.get_parameter("loihi_backend").value),
             mock_error_gain=float(self.get_parameter("mock_error_gain").value),
@@ -1525,6 +1840,13 @@ class CrazyflieROS2Node(Node):
             loihi_parallel_quant_bins=int(self.get_parameter("loihi_parallel_quant_bins").value),
             loihi_vector_max_abs_int=int(self.get_parameter("loihi_vector_max_abs_int").value),
             loihi_max_control_ticks=int(self.get_parameter("loihi_max_control_ticks").value),
+            loihi_selected_position_index=int(
+                self.get_parameter("loihi_selected_position_index").value
+            ),
+            loihi_xy_dynamic_bounds_start_index=int(
+                self.get_parameter("loihi_xy_dynamic_bounds_start_index").value
+            ),
+            loihi_no_warm_start=bool(self.get_parameter("loihi_no_warm_start").value),
             loihi_match_timeout_s=float(self.get_parameter("loihi_match_timeout_s").value),
             max_loihi_latency_s=float(self.get_parameter("max_loihi_latency_s").value),
             loihi_ethernet_output_buffer_steps=int(

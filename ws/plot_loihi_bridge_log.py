@@ -32,6 +32,18 @@ def load_rows(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+def demo_segment(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    start = next((idx for idx, row in enumerate(rows) if row.get("mode") == "LOIHI_DEMO"), None)
+    if start is None:
+        return []
+    end = len(rows)
+    for idx in range(start + 1, len(rows)):
+        if rows[idx].get("mode") != "LOIHI_DEMO":
+            end = idx
+            break
+    return rows[start:end]
+
+
 def series(rows: list[dict[str, str]], key: str) -> list[float]:
     return [value(row, key) for row in rows]
 
@@ -66,6 +78,13 @@ def plot_xyz_time(ax, t, rows, prefix: str, label: str, linestyle: str = "-") ->
     for axis in ("x", "y", "z"):
         tx, yy = finite_pairs(t, series(rows, f"{prefix}_{axis}"))
         ax.plot(tx, yy, color=colors[axis], linestyle=linestyle, linewidth=1.1, label=f"{label} {axis}")
+
+
+def subtract_series(a: list[float], b: list[float]) -> list[float]:
+    out = []
+    for x, y in zip(a, b):
+        out.append(x - y if math.isfinite(x) and math.isfinite(y) else math.nan)
+    return out
 
 
 def mode_spans(ax, t: list[float], rows: list[dict[str, str]]) -> None:
@@ -107,11 +126,6 @@ def main() -> None:
         help="Output image path. Defaults to <input>_plot.png.",
     )
     parser.add_argument("--show", action="store_true", help="Show the plot window.")
-    parser.add_argument(
-        "--demo-only",
-        action="store_true",
-        help="Only plot rows where mode is LOIHI_DEMO.",
-    )
     args = parser.parse_args()
 
     if args.input is None:
@@ -120,10 +134,9 @@ def main() -> None:
     output_path = args.output or input_path.with_name(f"{input_path.stem}_plot.png")
 
     rows = load_rows(input_path)
-    if args.demo_only:
-        rows = [row for row in rows if row.get("mode") == "LOIHI_DEMO"]
-        if not rows:
-            raise ValueError(f"No LOIHI_DEMO rows found in {input_path}")
+    demo_rows = demo_segment(rows)
+    if demo_rows:
+        rows = demo_rows
 
     t = time_axis(rows)
     state_x = series(rows, "state_x")
@@ -132,6 +145,8 @@ def main() -> None:
     ref_x = series(rows, "ref_x")
     ref_y = series(rows, "ref_y")
     ref_z = series(rows, "ref_z")
+    ref_next_x = series(rows, "ref_next_x")
+    ref_next_y = series(rows, "ref_next_y")
     cmd_x = series(rows, "cmd_x")
     cmd_y = series(rows, "cmd_y")
     cmd_z = series(rows, "cmd_z")
@@ -187,6 +202,18 @@ def main() -> None:
     mode_spans(ax_xy_time, t, rows)
     plot_xyz_time(ax_xy_time, t, rows, "state", "state")
     plot_xyz_time(ax_xy_time, t, rows, "ref", "ref", "--")
+    world_x_min = subtract_series(ref_next_x, series(rows, "bound_ex_max"))
+    world_x_max = subtract_series(ref_next_x, series(rows, "bound_ex_min"))
+    world_y_min = subtract_series(ref_next_y, series(rows, "bound_ey_max"))
+    world_y_max = subtract_series(ref_next_y, series(rows, "bound_ey_min"))
+    for data, label, color in (
+        (world_x_min, "x bound", "tab:blue"),
+        (world_x_max, "x bound", "tab:blue"),
+        (world_y_min, "y bound", "tab:green"),
+        (world_y_max, "y bound", "tab:green"),
+    ):
+        tx, yy = finite_pairs(t, data)
+        ax_xy_time.plot(tx, yy, color=color, linestyle=":", linewidth=1.0, label=label)
     ax_xy_time.set_title("State and Reference")
     ax_xy_time.set_xlabel("time [s]")
     ax_xy_time.set_ylabel("position [m]")
