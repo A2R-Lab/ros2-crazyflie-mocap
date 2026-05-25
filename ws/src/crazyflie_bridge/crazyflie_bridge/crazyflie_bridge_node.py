@@ -542,10 +542,11 @@ class DynamicBoundsShifter:
         lx, ly = self._staged_half_extents(reference.t_s)
         x_ref = float(reference.position_m[0])
         y_ref = float(reference.position_m[1])
-        world_x_min = -lx
-        world_x_max = lx
-        world_y_min = -ly
-        world_y_max = ly
+        box_center = self.config.circle_center_m
+        world_x_min = float(box_center[0]) - lx
+        world_x_max = float(box_center[0]) + lx
+        world_y_min = float(box_center[1]) - ly
+        world_y_max = float(box_center[1]) + ly
         return np.asarray(
             [
                 x_ref - world_x_max,
