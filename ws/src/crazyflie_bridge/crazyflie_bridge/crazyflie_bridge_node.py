@@ -792,9 +792,8 @@ class RealLoihiBackend(BaseLoihiBackend):
             )
 
         from admm_mpc.core import choose_vector_exp, dequantize_vector, quantize_vector
-        from admm_mpc.direct import build_direct_solve_pipeline
-        from admm_mpc.pipeline import build_repeated_mpc_pipeline
-        from admm_mpc.repeated import DirectSelectedStreamingEthernetSession
+        from admm_mpc.direct import build_admm_mpc_pipeline
+        from admm_mpc.solver import StreamingMpcSession
         from script.header_generator import build_default_bounds, get_solver_problem_data
 
         self._dequantize_vector = dequantize_vector
@@ -822,23 +821,17 @@ class RealLoihiBackend(BaseLoihiBackend):
         if initial_state.shape[0] != n_state:
             raise ValueError(f"initial_state must have length {n_state}, got {initial_state.shape[0]}")
         l, u = build_default_bounds(np.zeros(n_state, dtype=np.float64))
-        repeated_pipeline = build_repeated_mpc_pipeline(
+        solver_pipeline = build_admm_mpc_pipeline(
             problem_data,
             l,
             u,
             vector_exp,
             parallel_components=int(self.config.loihi_parallel_components),
             parallel_quant_bins=int(self.config.loihi_parallel_quant_bins),
-        )
-        direct_pipeline = build_direct_solve_pipeline(
-            problem_data,
-            repeated_pipeline,
-            parallel_components=int(self.config.loihi_parallel_components),
-            parallel_quant_bins=int(self.config.loihi_parallel_quant_bins),
             selected_position_index=int(self.config.loihi_selected_position_index),
             xy_dynamic_bounds_start_index=int(self.config.loihi_xy_dynamic_bounds_start_index),
         )
-        self.selected_position_index = int(direct_pipeline.selected_position_index)
+        self.selected_position_index = int(solver_pipeline.selected_position_index)
 
         y0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
         z0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
@@ -849,7 +842,7 @@ class RealLoihiBackend(BaseLoihiBackend):
         run_periods = max(1, int(self.config.loihi_max_control_ticks) * input_periods)
 
         LOGGER.info(
-            "Starting DirectSelectedStreamingEthernetSession: ticks=%d admm_iterations=%d input_periods=%d vector_exp=%d selected_position_index=%d xy_dynamic_bounds_start_index=%d no_warm_start=%s",
+            "Starting StreamingMpcSession: ticks=%d admm_iterations=%d input_periods=%d vector_exp=%d selected_position_index=%d xy_dynamic_bounds_start_index=%d no_warm_start=%s",
             int(self.config.loihi_max_control_ticks),
             int(self.config.loihi_admm_iterations),
             input_periods,
@@ -858,8 +851,8 @@ class RealLoihiBackend(BaseLoihiBackend):
             int(self.config.loihi_xy_dynamic_bounds_start_index),
             bool(self.config.loihi_no_warm_start),
         )
-        self.session = DirectSelectedStreamingEthernetSession(
-            direct_pipeline,
+        self.session = StreamingMpcSession(
+            solver_pipeline,
             run_periods=run_periods,
             input_periods=input_periods,
             z_initial_state=z0_int,
