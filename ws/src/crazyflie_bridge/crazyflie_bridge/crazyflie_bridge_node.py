@@ -142,6 +142,10 @@ class CrazyflieController:
         self.trajectory_start_time = 0.0
         self.trajectory_next_index = 0  # next CSV line to apply when its time is reached
         self.mocap_log_file = None
+        self.fpga_log_file = None
+        self.fpga_log_path = None
+        self.fpga_demo_start_time = 0.0
+        self.fpga_last_command = ""
         self.shutdown_requested = threading.Event()
         self._terminal_fd = None
         self._terminal_settings = None
@@ -162,6 +166,10 @@ class CrazyflieController:
             'stabilizer.pitch': 0,
             'stabilizer.yaw': 0,
             'range.zrange': 0,
+            'fpga.u1_16': 0,
+            'fpga.u2_16': 0,
+            'fpga.u3_16': 0,
+            'fpga.u4_16': 0,
         }
         
     def _param_callback(self, name, value):
@@ -223,6 +231,101 @@ class CrazyflieController:
             logger.error(f'Could not start log configuration: {e}')
         except AttributeError as e:
             logger.error(f'Could not add log config: {e}')
+
+        fpga_log_conf = LogConfig(name='FpgaControl', period_in_ms=50)
+        for var in ('fpga.u1_16', 'fpga.u2_16', 'fpga.u3_16', 'fpga.u4_16'):
+            fpga_log_conf.add_variable(var, 'int16_t')
+
+        try:
+            cf.log.add_config(fpga_log_conf)
+            fpga_log_conf.data_received_cb.add_callback(self._fpga_log_callback)
+            fpga_log_conf.start()
+            logger.info("FPGA control logging started")
+        except (KeyError, AttributeError) as e:
+            logger.warning(f"FPGA control log variables unavailable: {e}")
+
+    def _fpga_log_callback(self, timestamp, data, logconf):
+        """Callback for FPGA controller output logging."""
+        self.log_data.update(data)
+
+    def _open_fpga_demo_log(self, prefix):
+        if self.fpga_log_file is not None:
+            return
+
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.fpga_log_path = f"{prefix}_{ts}.csv"
+        self.fpga_demo_start_time = time.time()
+        self.fpga_last_command = ""
+
+        self.fpga_log_file = open(self.fpga_log_path, 'w', newline='')
+        self.fpga_log_file.write(
+            "monotonic_s,elapsed_s,wall_time_iso,event,"
+            "mocap_valid,mocap_x,mocap_y,mocap_z,"
+            "state_est_x,state_est_y,state_est_z,"
+            "stabilizer_roll,stabilizer_pitch,range_z_m,"
+            "target_x,target_y,target_z,"
+            "box_min_x,box_max_x,"
+            "mocap_stamp_s,box1_raw_x,box1_raw_y,box1_raw_z,box2_raw_x,box2_raw_y,box2_raw_z,"
+            "box1_cf_x,box2_cf_x,"
+            "dynamic_x_min_mm,dynamic_x_max_mm,"
+            "constraint_active,manual_constraints,"
+            "fpga_u1_16,fpga_u2_16,fpga_u3_16,fpga_u4_16,"
+            "command\n"
+        )
+        self.fpga_log_file.flush()
+        logger.info(f"FPGA demo logging to {self.fpga_log_path}")
+
+    def _close_fpga_demo_log(self):
+        if self.fpga_log_file is None:
+            return
+        try:
+            self.fpga_log_file.flush()
+            self.fpga_log_file.close()
+            logger.info(f"FPGA demo log closed: {self.fpga_log_path}")
+        except OSError as e:
+            logger.warning(f"Could not close FPGA demo log {self.fpga_log_path}: {e}")
+        finally:
+            self.fpga_log_file = None
+            self.fpga_log_path = None
+
+    def _write_fpga_demo_log_row(self, event, mocap_valid, x, y, z, box_min, box_max, extra=None, command=""):
+        if self.fpga_log_file is None:
+            return
+
+        extra = extra or {}
+        now = time.time()
+        elapsed = now - self.fpga_demo_start_time if self.fpga_demo_start_time > 0.0 else 0.0
+        wall_time = datetime.now().isoformat(timespec='milliseconds')
+        box_min_str = "" if box_min is None else f"{box_min:.6f}"
+        box_max_str = "" if box_max is None else f"{box_max:.6f}"
+        height_m = float(self.log_data.get('range.zrange', 0)) / 1000.0
+        command_to_write = command or self.fpga_last_command
+
+        self.fpga_log_file.write(
+            f"{now:.6f},{elapsed:.6f},{wall_time},{event},"
+            f"{1 if mocap_valid else 0},{x:.6f},{y:.6f},{z:.6f},"
+            f"{self.log_data.get('stateEstimate.x', 0):.6f},"
+            f"{self.log_data.get('stateEstimate.y', 0):.6f},"
+            f"{self.log_data.get('stateEstimate.z', 0):.6f},"
+            f"{self.log_data.get('stabilizer.roll', 0):.6f},"
+            f"{self.log_data.get('stabilizer.pitch', 0):.6f},"
+            f"{height_m:.6f},"
+            f"{self.target_x:.6f},{self.target_y:.6f},{self.target_z:.6f},"
+            f"{box_min_str},{box_max_str},"
+            f"{extra.get('mocap_stamp_s', '')},"
+            f"{extra.get('box1_raw_x', '')},{extra.get('box1_raw_y', '')},{extra.get('box1_raw_z', '')},"
+            f"{extra.get('box2_raw_x', '')},{extra.get('box2_raw_y', '')},{extra.get('box2_raw_z', '')},"
+            f"{extra.get('box1_cf_x', '')},{extra.get('box2_cf_x', '')},"
+            f"{self.dynamic_xy_min_mm},{self.dynamic_xy_max_mm},"
+            f"{1 if self.sending_constraints else 0},"
+            f"{1 if self.manual_constraints else 0},"
+            f"{self.log_data.get('fpga.u1_16', 0)},"
+            f"{self.log_data.get('fpga.u2_16', 0)},"
+            f"{self.log_data.get('fpga.u3_16', 0)},"
+            f"{self.log_data.get('fpga.u4_16', 0)},"
+            f"{command_to_write}\n"
+        )
+        self.fpga_log_file.flush()
     
         
     def _console_callback(self, text):
@@ -392,7 +495,7 @@ class CrazyflieController:
                     if current_time - self.last_extpos_time >= self.extpos_rate:
                         try:
                             # Also get box constraints if available
-                            x, y, z, qx, qy, qz, qw, mode, box_min, box_max = mocap_func()
+                            x, y, z, qx, qy, qz, qw, mode, box_min, box_max, mocap_extra = mocap_func()
 
                             # Update constraints in controller
                             if box_min is not None and box_max is not None and not self.manual_constraints:
@@ -400,6 +503,7 @@ class CrazyflieController:
                                 self.dynamic_xy_max_mm = int(box_max * 1000.0)
 
                             if x > -25.0:  # Check for valid mocap data
+                                self._write_fpga_demo_log_row("sample", True, x, y, z, box_min, box_max, mocap_extra)
                                 # Log mocap to CSV while playing trajectory
                                 if self.state == 'PLAYING_TRAJECTORY' and self.mocap_log_file is not None and self.trajectory_origin is not None:
                                     elapsed_ms = (current_time - self.trajectory_start_time) * 1000.0
@@ -441,6 +545,8 @@ class CrazyflieController:
                                     # Send full 6DoF pose from mocap
                                     self.current_yaw = quaternion_to_yaw(qx, qy, qz, qw)
                                     cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
+                            else:
+                                self._write_fpga_demo_log_row("sample", False, x, y, z, box_min, box_max, mocap_extra)
                                     
                             self.last_extpos_time = current_time
                         except Exception as e:
@@ -450,6 +556,8 @@ class CrazyflieController:
                 if self.sending_constraints and (current_time - self.last_constraint_send_time >= self.constraint_rate):
                     payload = (self.dynamic_xy_min_mm & 0xFFFF) | ((self.dynamic_xy_max_mm & 0xFFFF) << 16)
                     self._send_multiplexed_command(cf, self.CMD_SET_CONSTRAINTS, payload)
+                    self.fpga_last_command = "set_constraints"
+                    self._write_fpga_demo_log_row("command", True, self.target_x, self.target_y, self.target_z, None, None, command="set_constraints")
                     self.last_constraint_send_time = current_time
 
                 # Send setpoint at 50Hz based on state and mode
@@ -563,6 +671,7 @@ class CrazyflieController:
                 except OSError:
                     pass
                 self.mocap_log_file = None
+            self._close_fpga_demo_log()
             # Restore terminal settings
             self.restore_terminal()
             # Send stop command
@@ -741,7 +850,10 @@ class CrazyflieController:
         elif key == 'O':
             if self.state == 'FLYING' and self.use_mocap:
                 logger.info("▶ Starting ONBOARD FPGA trajectory")
+                self._open_fpga_demo_log("fpga_bridge_log")
                 self._send_multiplexed_command(cf, self.CMD_START_TRAJ)
+                self.fpga_last_command = "start_traj"
+                self._write_fpga_demo_log_row("command", True, self.target_x, self.target_y, self.target_z, None, None, command="start_traj")
             else:
                 logger.warning("⚠ Start onboard trajectory only when FLYING with mocap (press O)")
 
@@ -749,7 +861,10 @@ class CrazyflieController:
         elif key == 'D':
             if self.state == 'FLYING' and self.use_mocap:
                 logger.info("▶ Starting ONBOARD FPGA trajectory + DYNAMIC CONSTRAINTS")
+                self._open_fpga_demo_log("fpga_bridge_log")
                 self._send_multiplexed_command(cf, self.CMD_START_TRAJ)
+                self.fpga_last_command = "start_traj"
+                self._write_fpga_demo_log_row("command", True, self.target_x, self.target_y, self.target_z, None, None, command="start_traj")
                 self.sending_constraints = True
             else:
                 logger.warning("⚠ Start onboard trajectory with constraints only when FLYING with mocap (press D)")
@@ -759,8 +874,11 @@ class CrazyflieController:
             if self.state == 'FLYING' and self.use_mocap:
                 self.manual_constraints = False
                 logger.info("▣ Enabling DYNAMIC CONSTRAINTS without starting onboard trajectory")
+                self._open_fpga_demo_log("fpga_bridge_log")
                 self.sending_constraints = True
                 self.last_constraint_send_time = 0
+                self.fpga_last_command = "constraints_enabled"
+                self._write_fpga_demo_log_row("command", True, self.target_x, self.target_y, self.target_z, None, None, command="constraints_enabled")
             else:
                 logger.warning("⚠ Enable dynamic constraints only when FLYING with mocap (press B)")
 
@@ -799,11 +917,16 @@ class CrazyflieController:
             self.manual_constraints = False
             self.sending_constraints = False
             self._send_multiplexed_command(cf, self.CMD_SET_CONSTRAINTS, 0) # Payload 0 clears
+            self.fpga_last_command = "clear_constraints"
+            self._write_fpga_demo_log_row("command", True, self.target_x, self.target_y, self.target_z, None, None, command="clear_constraints")
 
         # Reset Onboard Trajectory (R)
         elif key == 'R':
             logger.info("↺ Resetting ONBOARD FPGA trajectory")
             self._send_multiplexed_command(cf, self.CMD_RESET_TRAJ)
+            self.fpga_last_command = "reset_traj"
+            self._write_fpga_demo_log_row("command", True, self.target_x, self.target_y, self.target_z, None, None, command="reset_traj")
+            self._close_fpga_demo_log()
         
         # Yaw/Kalman reset - use when drone is facing +X to reset yaw reference
         elif key == '0':
@@ -909,7 +1032,7 @@ class CrazyflieROS2Node(Node):
         # Trajectory offset [x, y, z, yaw_deg] in world frame.
         # Each CSV point is applied as: world_target = trajectory_offset + trajectory_point.
         # Trajectory point (0, 0, 0, 0) is located at trajectory_offset.
-        self.declare_parameter('trajectory_offset', [0.45, -0.55, 0.3, 0.0])
+        self.declare_parameter('trajectory_offset', [0.72, 0.48, 0.3, 0.0])
         # x=0.390 y=-0.582 z=0.517
         # Get parameters
         self.uri = self.get_parameter('uri').value
@@ -1001,12 +1124,13 @@ class CrazyflieROS2Node(Node):
         2. Axis sign flipping (axis_sign parameter)
         3. Yaw offset correction (yaw_offset_deg parameter)
         
-        Returns: (x, y, z, qx, qy, qz, qw, mocap_mode, box_min_x, box_max_x)
+        Returns: (x, y, z, qx, qy, qz, qw, mocap_mode, box_min_x, box_max_x, extra)
         """
         with self.mocap_lock:
             # Handle box constraints
             box_min = None
             box_max = None
+            extra = {}
             if self.box1_pose is not None and self.box2_pose is not None:
                 box1_raw = [
                     self.box1_pose.pose.position.x,
@@ -1025,6 +1149,16 @@ class CrazyflieROS2Node(Node):
                 raw_box_max = max(b1_x, b2_x)
                 box_min = raw_box_min + OBSTACLE_MARGIN_M
                 box_max = raw_box_max - OBSTACLE_MARGIN_M
+                extra.update({
+                    "box1_raw_x": f"{box1_raw[0]:.6f}",
+                    "box1_raw_y": f"{box1_raw[1]:.6f}",
+                    "box1_raw_z": f"{box1_raw[2]:.6f}",
+                    "box2_raw_x": f"{box2_raw[0]:.6f}",
+                    "box2_raw_y": f"{box2_raw[1]:.6f}",
+                    "box2_raw_z": f"{box2_raw[2]:.6f}",
+                    "box1_cf_x": f"{b1_x:.6f}",
+                    "box2_cf_x": f"{b2_x:.6f}",
+                })
                 if box_min > box_max:
                     midpoint = 0.5 * (raw_box_min + raw_box_max)
                     box_min = midpoint
@@ -1042,7 +1176,9 @@ class CrazyflieROS2Node(Node):
                     self.last_box_log_time = now
 
             if self.mocap_pose is None:
-                return (-30.0, -30.0, 0.0, 0.0, 0.0, 0.0, 1.0, self.mocap_mode, box_min, box_max)  # Invalid data
+                return (-30.0, -30.0, 0.0, 0.0, 0.0, 0.0, 1.0, self.mocap_mode, box_min, box_max, extra)  # Invalid data
+
+            extra["mocap_stamp_s"] = f"{self.mocap_pose.header.stamp.sec + self.mocap_pose.header.stamp.nanosec * 1e-9:.9f}"
             
             # Raw mocap position data
             pos_raw = [
@@ -1062,7 +1198,7 @@ class CrazyflieROS2Node(Node):
             # The quaternion from a single marker is meaningless
             # Yaw will come from Crazyflie's IMU instead
             if self.mocap_mode == 'position_only':
-                return (x, y, z, 0.0, 0.0, 0.0, 1.0, self.mocap_mode, box_min, box_max)
+                return (x, y, z, 0.0, 0.0, 0.0, 1.0, self.mocap_mode, box_min, box_max, extra)
             
             # Process quaternion for modes that use mocap orientation
             qx_raw = self.mocap_pose.pose.orientation.x
@@ -1089,7 +1225,7 @@ class CrazyflieROS2Node(Node):
                     qx, qy, qz, qw, self.yaw_offset_rad
                 )
             
-            return (x, y, z, qx, qy, qz, qw, self.mocap_mode, box_min, box_max)
+            return (x, y, z, qx, qy, qz, qw, self.mocap_mode, box_min, box_max, extra)
     
     def run(self):
         """Main run function"""
