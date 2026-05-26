@@ -178,6 +178,7 @@ class LoihiResult:
     u0: np.ndarray
     selected_error_position_m: np.ndarray
     latency_s: float
+    xy_trajectory_m: Optional[np.ndarray] = None
     raw_output: Optional[np.ndarray] = None
 
 
@@ -235,6 +236,7 @@ class BridgeConfig:
     loihi_vector_max_abs_int: int
     loihi_max_control_ticks: int
     loihi_selected_position_index: int
+    loihi_selected_output_mode: str
     loihi_xy_dynamic_bounds_start_index: int
     loihi_no_warm_start: bool
     loihi_match_timeout_s: float
@@ -594,6 +596,7 @@ class MockLoihiBackend(BaseLoihiBackend):
             u0=np.zeros(4, dtype=np.float64),
             selected_error_position_m=e_p1,
             latency_s=time.monotonic() - start_s,
+            xy_trajectory_m=None,
             raw_output=None,
         )
 
@@ -717,6 +720,9 @@ class HostFloatLoihiBackend(BaseLoihiBackend):
         self.y_state = y_state
         u0_start = self.state_dim
         selected_start = self.selected_position_index * (self.state_dim + self.control_dim)
+        ax = self.A @ x
+        xy_start = self.equality_rows + self.input_inequality_rows
+        xy_end = xy_start + self.xy_inequality_rows
         return LoihiResult(
             output_epoch=int(request.epoch),
             u0=np.asarray(x[u0_start : u0_start + self.control_dim], dtype=np.float64),
@@ -725,6 +731,7 @@ class HostFloatLoihiBackend(BaseLoihiBackend):
                 dtype=np.float64,
             ),
             latency_s=time.monotonic() - start_s,
+            xy_trajectory_m=np.asarray(ax[xy_start:xy_end], dtype=np.float64),
             raw_output=None,
         )
 
@@ -750,6 +757,7 @@ class RealLoihiBackend(BaseLoihiBackend):
         self.vector_exp: Optional[int] = None
         self.problem_data = None
         self.control_dim = 4
+        self.horizon = 0
         self._prepare_import_path()
         self._preload_runtime_modules()
 
@@ -798,6 +806,12 @@ class RealLoihiBackend(BaseLoihiBackend):
 
         self._dequantize_vector = dequantize_vector
         self._quantize_vector = quantize_vector
+        selected_output_mode = str(self.config.loihi_selected_output_mode)
+        if selected_output_mode not in ("u0_xyz", "selected_xyz", "u0_xy_traj"):
+            raise ValueError(
+                "loihi_selected_output_mode must be one of: u0_xyz, selected_xyz, u0_xy_traj; "
+                f"got {selected_output_mode!r}."
+            )
 
         problem_data = get_solver_problem_data()
         self.problem_data = problem_data
@@ -832,6 +846,7 @@ class RealLoihiBackend(BaseLoihiBackend):
             xy_dynamic_bounds_start_index=int(self.config.loihi_xy_dynamic_bounds_start_index),
         )
         self.selected_position_index = int(solver_pipeline.selected_position_index)
+        self.horizon = int(solver_pipeline.horizon)
 
         y0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
         z0_int = np.zeros(problem_data["A"].shape[0], dtype=np.int64)
@@ -842,12 +857,13 @@ class RealLoihiBackend(BaseLoihiBackend):
         run_periods = max(1, int(self.config.loihi_max_control_ticks) * input_periods)
 
         LOGGER.info(
-            "Starting StreamingMpcSession: ticks=%d admm_iterations=%d input_periods=%d vector_exp=%d selected_position_index=%d xy_dynamic_bounds_start_index=%d no_warm_start=%s",
+            "Starting StreamingMpcSession: ticks=%d admm_iterations=%d input_periods=%d vector_exp=%d selected_position_index=%d selected_output_mode=%s xy_dynamic_bounds_start_index=%d no_warm_start=%s",
             int(self.config.loihi_max_control_ticks),
             int(self.config.loihi_admm_iterations),
             input_periods,
             int(vector_exp),
             self.selected_position_index,
+            str(self.config.loihi_selected_output_mode),
             int(self.config.loihi_xy_dynamic_bounds_start_index),
             bool(self.config.loihi_no_warm_start),
         )
@@ -862,7 +878,7 @@ class RealLoihiBackend(BaseLoihiBackend):
             fresh_epoch_gate=True,
             dynamic_xy_bounds=True,
             ethernet_output_buffer_steps=int(self.config.loihi_ethernet_output_buffer_steps),
-            selected_output_mode="selected_xyz",
+            selected_output_mode=selected_output_mode,
             resident_cold_start=bool(self.config.loihi_no_warm_start),
         )
 
@@ -883,9 +899,30 @@ class RealLoihiBackend(BaseLoihiBackend):
         raw = np.asarray(latest["x"], dtype=np.int64)
         output_epoch = int(latest["epoch"])
         offset = 1
-        if raw.shape[0] == 1 + 3:
+        selected_output_mode = str(self.config.loihi_selected_output_mode)
+        xy_trajectory = None
+        if selected_output_mode == "selected_xyz" or raw.shape[0] == 1 + 3:
             u0 = np.zeros(self.control_dim, dtype=np.float64)
             selected_error_position = self._dequantize_vector(raw[offset : offset + 3], self.vector_exp)
+        elif selected_output_mode == "u0_xy_traj":
+            u0 = self._dequantize_vector(raw[offset : offset + self.control_dim], self.vector_exp)
+            xy_start = offset + self.control_dim
+            xy_stop = xy_start + 2 * int(self.horizon)
+            if raw.shape[0] < xy_stop:
+                raise RuntimeError(
+                    f"u0_xy_traj packet length {raw.shape[0]} is too short for horizon {self.horizon}."
+                )
+            xy_trajectory = self._dequantize_vector(raw[xy_start:xy_stop], self.vector_exp)
+            selected_idx = max(1, int(getattr(self, "selected_position_index", 1)))
+            selected_xy_start = 2 * (selected_idx - 1)
+            selected_error_position = np.asarray(
+                [
+                    xy_trajectory[selected_xy_start],
+                    xy_trajectory[selected_xy_start + 1],
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
         else:
             u0 = self._dequantize_vector(raw[offset : offset + self.control_dim], self.vector_exp)
             selected_error_position = self._dequantize_vector(
@@ -900,6 +937,7 @@ class RealLoihiBackend(BaseLoihiBackend):
             u0=np.asarray(u0, dtype=np.float64),
             selected_error_position_m=np.asarray(selected_error_position, dtype=np.float64),
             latency_s=float(latency_s),
+            xy_trajectory_m=None if xy_trajectory is None else np.asarray(xy_trajectory, dtype=np.float64),
             raw_output=raw.copy(),
         )
 
@@ -951,19 +989,7 @@ class SafetySupervisor:
         z_min = self.config.z_min_m if z_min_m is None else float(z_min_m)
         position[2] = float(np.clip(position[2], z_min, self.config.z_max_m))
 
-        if last_command is not None:
-            anchor = np.asarray(last_command.position_m, dtype=np.float64)
-        else:
-            anchor = finite_or_none(anchor_position_m)
-
-        if anchor is not None:
-            delta = position - anchor
-            norm = float(np.linalg.norm(delta))
-            max_step = float(self.config.max_command_step_m)
-            if max_step > 0.0 and norm > max_step:
-                position = anchor + delta * (max_step / norm)
-                position[2] = float(np.clip(position[2], z_min, self.config.z_max_m))
-
+        del anchor_position_m, last_command
         return Command(position_m=position, yaw_rad=float(proposed.yaw_rad))
 
 
@@ -1030,6 +1056,11 @@ class BridgeCsvLogger:
         "selected_ep_x",
         "selected_ep_y",
         "selected_ep_z",
+        *[
+            field
+            for idx in range(1, 11)
+            for field in (f"loihi_xy_traj_{idx:02d}_x", f"loihi_xy_traj_{idx:02d}_y")
+        ],
         "cmd_x",
         "cmd_y",
         "cmd_z",
@@ -1667,7 +1698,7 @@ class CrazyflieLoihiBridge:
     def _result_row(self, result: LoihiResult) -> Dict[str, object]:
         u0 = np.zeros(4, dtype=np.float64)
         u0[: min(4, result.u0.shape[0])] = result.u0[: min(4, result.u0.shape[0])]
-        return {
+        row = {
             "output_epoch": int(result.output_epoch),
             "selected_position_index": self._selected_reference_steps(),
             "loihi_latency_s": f"{result.latency_s:.6f}",
@@ -1679,6 +1710,12 @@ class CrazyflieLoihiBridge:
             "selected_ep_y": f"{result.selected_error_position_m[1]:.6f}",
             "selected_ep_z": f"{result.selected_error_position_m[2]:.6f}",
         }
+        if result.xy_trajectory_m is not None:
+            xy = np.asarray(result.xy_trajectory_m, dtype=np.float64)
+            for idx in range(min(10, xy.shape[0] // 2)):
+                row[f"loihi_xy_traj_{idx + 1:02d}_x"] = f"{xy[2 * idx]:.6f}"
+                row[f"loihi_xy_traj_{idx + 1:02d}_y"] = f"{xy[2 * idx + 1]:.6f}"
+        return row
 
     def _print_status(self, row: Dict[str, object]) -> None:
         LOGGER.info(
@@ -1773,6 +1810,7 @@ class CrazyflieROS2Node(Node):
         self.declare_parameter("loihi_vector_max_abs_int", -1)
         self.declare_parameter("loihi_max_control_ticks", 60000)
         self.declare_parameter("loihi_selected_position_index", -1)
+        self.declare_parameter("loihi_selected_output_mode", "u0_xy_traj")
         self.declare_parameter("loihi_xy_dynamic_bounds_start_index", 1)
         self.declare_parameter("loihi_no_warm_start", False)
         self.declare_parameter("loihi_match_timeout_s", 0.1)
@@ -1837,6 +1875,7 @@ class CrazyflieROS2Node(Node):
             loihi_selected_position_index=int(
                 self.get_parameter("loihi_selected_position_index").value
             ),
+            loihi_selected_output_mode=str(self.get_parameter("loihi_selected_output_mode").value),
             loihi_xy_dynamic_bounds_start_index=int(
                 self.get_parameter("loihi_xy_dynamic_bounds_start_index").value
             ),
