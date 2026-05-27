@@ -8,11 +8,13 @@ HOST_SSH_DIR ?= /home/$(USER)/.ssh
 
 BRIDGE_ARGS ?=
 BRIDGE_BASE_ARGS ?= --ros-args -p admm_nxcore_path:=$(NEUROMORPHIC_ROOT)/admm_nxcore
+POWER_ARGS ?=
+POWER_BASE_ARGS ?= --ros-args -p NXSDKHOST:=10.42.0.100 -p ssh_key_path:=/root/.ssh/id_ed25519
 PLOT_LOG ?=
 PLOT_ARGS ?=
 DEMO_PLAN_ARGS ?=
 
-.PHONY: build run attach loihi-shell setup-ssh build-ws setup-intel-cflib rebuild-nx-streaming-output smoke smoke-ssh bridge-log bridge-mock bridge-float bridge-real plot-loihi-log plot-demo-plan
+.PHONY: build run attach loihi-shell setup-ssh build-ws setup-intel-cflib rebuild-nx-streaming-output smoke smoke-ssh power-node bridge-log bridge-mock bridge-float bridge-real plot-loihi-log plot-demo-plan
 
 build:
 	docker build . -t $(IMAGE)
@@ -49,7 +51,7 @@ setup-ssh:
 	docker exec $(CONTAINER) bash -lc 'install -d -m 700 /root/.ssh && cp /host_ssh/id_ed25519 /root/.ssh/id_ed25519 && cp /host_ssh/config /root/.ssh/config && chmod 600 /root/.ssh/id_ed25519 /root/.ssh/config && ssh-keyscan -H 10.42.0.100 >> /root/.ssh/known_hosts && chmod 600 /root/.ssh/known_hosts'
 
 build-ws:
-	docker exec $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && cd $(CRAZYFLIE_WS) && colcon build --symlink-install --packages-select crazyflie_bridge'
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && cd $(CRAZYFLIE_WS) && colcon build --symlink-install --packages-select loihi_power_msgs loihi_power crazyflie_bridge'
 
 setup-intel-cflib:
 	docker exec $(CONTAINER) bash -lc 'git config --global --add safe.directory $(NEUROMORPHIC_ROOT)/crazyflie-lib-python && source /intel/variables.sh eth && source /intel/venv/bin/activate && python3 -m pip install pyusb libusb-package pyserial packaging && python3 -m pip install --no-deps -e $(NEUROMORPHIC_ROOT)/crazyflie-lib-python'
@@ -62,6 +64,9 @@ smoke:
 
 smoke-ssh:
 	docker exec $(CONTAINER) bash -lc 'ssh -o BatchMode=yes -o ConnectTimeout=5 10.42.0.100 true && echo "loihi ssh ok"'
+
+power-node:
+	docker exec -it $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && source $(CRAZYFLIE_WS)/install/setup.sh && source /intel/variables.sh eth && source /intel/venv/bin/activate && cd $(CRAZYFLIE_WS) && python3 -m loihi_power.loihi_power_node $(POWER_BASE_ARGS) $(POWER_ARGS)'
 
 bridge-log:
 	docker exec -it $(CONTAINER) bash -lc 'source /opt/ros/humble/setup.sh && source $(CRAZYFLIE_WS)/install/setup.sh && source /intel/variables.sh eth && source /intel/venv/bin/activate && cd $(CRAZYFLIE_WS) && python3 -m crazyflie_bridge.crazyflie_bridge_node $(BRIDGE_BASE_ARGS) -p arm_on_connect:=false -p position_commands_enabled:=false -p loihi_backend:=disabled $(BRIDGE_ARGS)'

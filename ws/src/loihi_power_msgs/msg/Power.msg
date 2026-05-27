@@ -1,0 +1,9 @@
+std_msgs/Header header
+int32 id
+int32 time
+int32 acc_count
+float32 vddm
+float32 vddio
+float32 vdd
+float32 na
+float32 total

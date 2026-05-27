@@ -27,10 +27,11 @@ from cflib.utils.encoding import decompress_quaternion
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from loihi_power_msgs.msg import Power
 from rclpy.node import Node
 
 
-URI = uri_helper.uri_from_env(default="radio://0/80/2M/E7E7E7E7E7")
+URI = uri_helper.uri_from_env(default="radio://0/80/2M/E7E7E7E7E6")
 DEFAULT_CIRCLE_RADIUS_M = 0.25
 DEFAULT_CIRCLE_OMEGA_RAD_S = 1.40
 DEFAULT_CIRCLE_CENTER_M = [0.0, 0.0, 0.5]
@@ -155,6 +156,19 @@ class MocapSample:
 
 
 @dataclass
+class LoihiPowerSample:
+    id: int
+    time: int
+    acc_count: int
+    vddm_w: float
+    vddio_w: float
+    vdd_w: float
+    na_w: float
+    total_w: float
+    received_s: float
+
+
+@dataclass
 class ReferencePoint:
     position_m: np.ndarray
     velocity_mps: np.ndarray
@@ -239,6 +253,7 @@ class BridgeConfig:
     loihi_selected_output_mode: str
     loihi_xy_dynamic_bounds_start_index: int
     loihi_no_warm_start: bool
+    loihi_start_on_configure: bool
     loihi_match_timeout_s: float
     max_loihi_latency_s: float
     loihi_ethernet_output_buffer_steps: int
@@ -420,6 +435,75 @@ class MocapAdapter:
             return True
         cf.extpos.send_extpose(x, y, z, *sample.quaternion_xyzw.tolist())
         return True
+
+
+class LoihiPowerTelemetry:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._latest: Dict[str, LoihiPowerSample] = {}
+
+    def update(self, name: str, msg: Power) -> None:
+        sample = LoihiPowerSample(
+            id=int(msg.id),
+            time=int(msg.time),
+            acc_count=int(msg.acc_count),
+            vddm_w=float(msg.vddm),
+            vddio_w=float(msg.vddio),
+            vdd_w=float(msg.vdd),
+            na_w=float(msg.na),
+            total_w=float(msg.total),
+            received_s=time.monotonic(),
+        )
+        with self._lock:
+            self._latest[str(name)] = sample
+
+    def latest(self, name: str) -> Optional[LoihiPowerSample]:
+        with self._lock:
+            return self._latest.get(str(name))
+
+    def fill_row(self, row: Dict[str, object], now_s: float) -> None:
+        self._fill_raw_row(row, "power", self.latest("power"), now_s)
+        self._fill_power_only_row(row, "dynamic_power", self.latest("dynamic_power"), now_s)
+        self._fill_power_only_row(row, "idle_power", self.latest("idle_power"), now_s)
+
+    @staticmethod
+    def _fill_raw_row(
+        row: Dict[str, object],
+        prefix: str,
+        sample: Optional[LoihiPowerSample],
+        now_s: float,
+    ) -> None:
+        if sample is None:
+            return
+        row[f"{prefix}_age_s"] = f"{now_s - sample.received_s:.6f}"
+        row[f"{prefix}_id"] = int(sample.id)
+        row[f"{prefix}_time"] = int(sample.time)
+        row[f"{prefix}_acc_count"] = int(sample.acc_count)
+        LoihiPowerTelemetry._fill_power_fields(row, prefix, sample)
+
+    @staticmethod
+    def _fill_power_only_row(
+        row: Dict[str, object],
+        prefix: str,
+        sample: Optional[LoihiPowerSample],
+        now_s: float,
+    ) -> None:
+        if sample is None:
+            return
+        row[f"{prefix}_age_s"] = f"{now_s - sample.received_s:.6f}"
+        LoihiPowerTelemetry._fill_power_fields(row, prefix, sample)
+
+    @staticmethod
+    def _fill_power_fields(
+        row: Dict[str, object],
+        prefix: str,
+        sample: LoihiPowerSample,
+    ) -> None:
+        row[f"{prefix}_vddm_w"] = f"{sample.vddm_w:.6f}"
+        row[f"{prefix}_vddio_w"] = f"{sample.vddio_w:.6f}"
+        row[f"{prefix}_vdd_w"] = f"{sample.vdd_w:.6f}"
+        row[f"{prefix}_na_w"] = f"{sample.na_w:.6f}"
+        row[f"{prefix}_total_w"] = f"{sample.total_w:.6f}"
 
 
 class CircleReferenceGenerator:
@@ -1065,6 +1149,27 @@ class BridgeCsvLogger:
         "cmd_y",
         "cmd_z",
         "cmd_yaw_deg",
+        "power_age_s",
+        "power_id",
+        "power_time",
+        "power_acc_count",
+        "power_vddm_w",
+        "power_vddio_w",
+        "power_vdd_w",
+        "power_na_w",
+        "power_total_w",
+        "dynamic_power_age_s",
+        "dynamic_power_vddm_w",
+        "dynamic_power_vddio_w",
+        "dynamic_power_vdd_w",
+        "dynamic_power_na_w",
+        "dynamic_power_total_w",
+        "idle_power_age_s",
+        "idle_power_vddm_w",
+        "idle_power_vddio_w",
+        "idle_power_vdd_w",
+        "idle_power_na_w",
+        "idle_power_total_w",
     ]
 
     def __init__(self, path: str):
@@ -1131,14 +1236,16 @@ class CrazyflieLoihiBridge:
     MODE_MANUAL = "LOIHI_MANUAL"
     MODE_LANDING = "LANDING"
 
-    def __init__(self, config: BridgeConfig, mocap: MocapAdapter):
+    def __init__(self, config: BridgeConfig, mocap: MocapAdapter, power: LoihiPowerTelemetry):
         self.config = config
         self.mocap = mocap
+        self.power = power
         self.shutdown_requested = threading.Event()
         self.state_adapter = StateEstimateZLogAdapter(config.state_log_period_ms)
         self.reference_generator = CircleReferenceGenerator(config)
         self.bounds_shifter = DynamicBoundsShifter(config)
         self.backend = self._make_backend(config)
+        self.backend_started = False
         self.command_adapter = PositionCommandAdapter(config.position_commands_enabled)
         self.safety = SafetySupervisor(config)
         self.terminal = TerminalInput()
@@ -1187,11 +1294,19 @@ class CrazyflieLoihiBridge:
         cf.param.set_value("kalman.resetEstimation", 0)
         time.sleep(0.5)
 
-        self.backend.start(np.zeros(12, dtype=np.float64))
+        if self.config.loihi_start_on_configure:
+            self._start_backend()
 
         if self.config.arm_on_connect:
             cf.platform.send_arming_request(True)
             LOGGER.info("Sent Crazyflie arming request")
+
+    def _start_backend(self) -> None:
+        if self.backend_started or self.backend.name == "disabled":
+            return
+        LOGGER.info("Starting Loihi backend session")
+        self.backend.start(np.zeros(12, dtype=np.float64))
+        self.backend_started = True
 
     def run(self, scf: SyncCrazyflie) -> None:
         cf = scf.cf
@@ -1302,6 +1417,7 @@ class CrazyflieLoihiBridge:
         if self.backend.name == "disabled":
             LOGGER.warning("Cannot start Loihi demo while loihi_backend is disabled")
             return
+        self._start_backend()
         state = self.state_adapter.latest()
         if state is not None:
             self.demo_yaw_hold_rad = state.yaw_rad
@@ -1326,6 +1442,7 @@ class CrazyflieLoihiBridge:
         if self.backend.name == "disabled":
             LOGGER.warning("Cannot start manual Loihi mode while loihi_backend is disabled")
             return
+        self._start_backend()
         state = self.state_adapter.latest()
         anchor = self._current_position_or_last_command(state)
         anchor[2] = float(np.clip(anchor[2], self.config.z_min_m, self.config.z_max_m))
@@ -1390,6 +1507,7 @@ class CrazyflieLoihiBridge:
             "state_age_s": "" if state_age is None else f"{state_age:.6f}",
             "mocap_age_s": "" if mocap_age is None else f"{mocap_age:.6f}",
         }
+        self.power.fill_row(row, now_s)
         self._fill_state_row(row, state)
 
         active_mode = self.mode != self.MODE_IDLE
@@ -1743,7 +1861,24 @@ class CrazyflieROS2Node(Node):
             self.config.yaw_offset_rad,
             self.config.mocap_mode,
         )
-        self.bridge = CrazyflieLoihiBridge(self.config, self.mocap_adapter)
+        self.power_telemetry = LoihiPowerTelemetry()
+        self.bridge = CrazyflieLoihiBridge(self.config, self.mocap_adapter, self.power_telemetry)
+        self.power_subs = [
+            self.create_subscription(
+                Power,
+                topic,
+                lambda msg, name=name: self.power_callback(name, msg),
+                10,
+            )
+            for name, topic in (
+                ("power", "/loihi_power"),
+                ("dynamic_power", "/loihi_dynamic_power"),
+                ("idle_power", "/loihi_idle_power"),
+            )
+        ]
+        self.get_logger().info(
+            "Subscribed to Loihi power topics: /loihi_power, /loihi_dynamic_power, /loihi_idle_power"
+        )
 
         if self.config.use_mocap:
             mocap_topic = self.get_parameter("mocap_topic").value
@@ -1813,6 +1948,7 @@ class CrazyflieROS2Node(Node):
         self.declare_parameter("loihi_selected_output_mode", "u0_xy_traj")
         self.declare_parameter("loihi_xy_dynamic_bounds_start_index", 1)
         self.declare_parameter("loihi_no_warm_start", False)
+        self.declare_parameter("loihi_start_on_configure", True)
         self.declare_parameter("loihi_match_timeout_s", 0.1)
         self.declare_parameter("max_loihi_latency_s", 0.1)
         self.declare_parameter("loihi_ethernet_output_buffer_steps", 4096)
@@ -1880,6 +2016,9 @@ class CrazyflieROS2Node(Node):
                 self.get_parameter("loihi_xy_dynamic_bounds_start_index").value
             ),
             loihi_no_warm_start=bool(self.get_parameter("loihi_no_warm_start").value),
+            loihi_start_on_configure=bool(
+                self.get_parameter("loihi_start_on_configure").value
+            ),
             loihi_match_timeout_s=float(self.get_parameter("loihi_match_timeout_s").value),
             max_loihi_latency_s=float(self.get_parameter("max_loihi_latency_s").value),
             loihi_ethernet_output_buffer_steps=int(
@@ -1903,6 +2042,9 @@ class CrazyflieROS2Node(Node):
 
     def mocap_callback(self, msg: PoseStamped) -> None:
         self.mocap_adapter.update(msg)
+
+    def power_callback(self, name: str, msg: Power) -> None:
+        self.power_telemetry.update(name, msg)
 
     def run(self) -> None:
         cflib.crtp.init_drivers()
