@@ -487,7 +487,16 @@ class CrazyflieController:
                     logger.info(f"⬆ TAKEOFF - position ({self.target_x:.2f}, {self.target_y:.2f}), yaw={self.target_yaw:.1f}°, rising to 0.5m")
                 else:
                     logger.info("⬆ TAKEOFF command - starting takeoff")
-                
+
+                # Re-arm right before takeoff. The one-shot arm in run() expires / the
+                # firmware auto-disarms while idle, so by the time you press 't' the
+                # drone is usually disarmed and the motors stay dead.
+                try:
+                    cf.platform.send_arming_request(True)
+                    logger.info("🔓 Re-armed for takeoff")
+                except Exception as e:
+                    logger.error(f"Arming request failed: {e}")
+
                 self.state = 'TAKING_OFF'
                 self.target_height = 0.0
             else:
